@@ -1,4 +1,5 @@
 import os
+import sys
 import shutil
 from dataclasses import dataclass, asdict
 import torch
@@ -15,6 +16,49 @@ from torchvision.ops import MLP
 import mlflow
 import mlflow.data 
 import numpy as np
+
+# -----------------------------------------------------------------------------
+# Platform Detection & Secret Management
+# -----------------------------------------------------------------------------
+def setup_environment():
+    """
+    Detects if running on Kaggle or Colab and sets up Databricks credentials
+    from their respective Secret managers.
+    """
+    print("Detecting environment...")
+    
+    # 1. Kaggle Detection
+    if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:
+        print(">> Detected Kaggle Environment")
+        try:
+            from kaggle_secrets import UserSecretsClient
+            user_secrets = UserSecretsClient()
+            os.environ["DATABRICKS_HOST"] = user_secrets.get_secret("DATABRICKS_HOST")
+            os.environ["DATABRICKS_TOKEN"] = user_secrets.get_secret("DATABRICKS_TOKEN")
+            os.environ["MLFLOW_TRACKING_URI"] = "databricks"
+            print("   Success: Retrieved secrets via kaggle_secrets.")
+        except Exception as e:
+            print(f"   Warning: Could not set secrets via Kaggle. Error: {e}")
+            print("   Ensure 'DATABRICKS_HOST' and 'DATABRICKS_TOKEN' are in Add-ons -> Secrets.")
+
+    # 2. Google Colab Detection
+    elif "COLAB_RELEASE_TAG" in os.environ or "google.colab" in sys.modules:
+        print(">> Detected Google Colab Environment")
+        try:
+            from google.colab import userdata
+            os.environ["DATABRICKS_HOST"] = userdata.get("DATABRICKS_HOST")
+            os.environ["DATABRICKS_TOKEN"] = userdata.get("DATABRICKS_TOKEN")
+            os.environ["MLFLOW_TRACKING_URI"] = "databricks"
+            print("   Success: Retrieved secrets via google.colab.userdata.")
+        except Exception as e:
+            print(f"   Warning: Could not set secrets via Colab. Error: {e}")
+            print("   Ensure 'DATABRICKS_HOST' and 'DATABRICKS_TOKEN' are in the Secrets tab (key icon).")
+            
+    # 3. Local/Other
+    else:
+        print(">> Detected Local/Generic Environment")
+        if "DATABRICKS_TOKEN" not in os.environ:
+            print("   Warning: DATABRICKS_TOKEN not found in env vars. MLflow might fail to log to remote.")
 
 # Setup device according to local hardware
 if torch.cuda.is_available():
@@ -286,6 +330,9 @@ def validate(net, probe, test_dl, device, use_amp, amp_dtype):
 
 def main(config: TrainingConfig):
     """Main training function."""
+    # Setup environment secrets (Kaggle/Colab)
+    setup_environment()
+    
     # Print configuration
     config.print_config()
     
