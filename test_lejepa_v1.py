@@ -1,5 +1,6 @@
 import os
 import tarfile
+from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,8 +8,6 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import v2
 import timm
 import tqdm
-from hydra import compose, initialize
-from omegaconf import DictConfig
 from datasets import load_dataset
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
@@ -34,6 +33,73 @@ else:
     use_amp = False
     amp_dtype = torch.float32
     print("Using CPU")
+
+
+@dataclass
+class TrainingConfig:
+    """Configuration for training the ViT encoder with LejEPA."""
+    # Model hyperparameters
+    lamb: float = 0.02              # Balance between SigReg and invariance loss
+    V: int = 4                      # Number of augmented views per image
+    proj_dim: int = 16              # Projection dimension
+    dropout: float = 0.1            # Dropout rate
+    
+    # Training hyperparameters
+    lr: float = 2e-3                # Learning rate
+    bs: int = 16                    # Batch size per GPU
+    accum_steps: int = 16           # Gradient accumulation steps
+    epochs: int = 2                 # Number of training epochs
+    
+    # Data parameters
+    img_size: int = 128             # Image size
+    num_classes: int = 10           # Number of classes (Imagenette has 10)
+    
+    # Regularization
+    label_smoothing: float = 0.1    # Label smoothing factor
+    weight_decay: float = 5e-2      # Weight decay for encoder
+    probe_weight_decay: float = 1e-7  # Weight decay for probe
+    max_grad_norm: float = 1.0      # Gradient clipping threshold
+    
+    # Data loading
+    num_workers: int = 4            # Number of data loading workers
+    
+    # Scheduler
+    warmup_epochs: int = 1          # Number of warmup epochs
+    min_lr: float = 1e-6            # Minimum learning rate
+    
+    # Early stopping
+    patience: int = 20              # Early stopping patience
+    
+    # Paths
+    archive_path: str = "/kaggle/input/imagenette-160-px/imagenette-160.tgz"
+    working_dir: str = "/kaggle/working/imagenette-160"
+    
+    def __post_init__(self):
+        """Validate configuration."""
+        assert self.bs > 0, "Batch size must be positive"
+        assert self.V >= 1, "Number of views must be at least 1"
+        assert self.accum_steps > 0, "Accumulation steps must be positive"
+        
+        effective_bs = self.bs * self.accum_steps
+        assert effective_bs <= 512, f"Effective batch size ({effective_bs}) too large"
+        
+        assert 0 <= self.lamb <= 1, "Lambda must be between 0 and 1"
+        assert self.dropout >= 0, "Dropout must be non-negative"
+    
+    @property
+    def effective_batch_size(self):
+        """Calculate effective batch size."""
+        return self.bs * self.accum_steps
+    
+    def print_config(self):
+        """Pretty print configuration."""
+        print(f"\n{'='*60}")
+        print("Training Configuration:")
+        for key, value in asdict(self).items():
+            if not key.startswith('_'):
+                print(f"  {key}: {value}")
+        print(f"  effective_batch_size: {self.effective_batch_size}")
+        print(f"{'='*60}\n")
 
 
 class SIGReg(torch.nn.Module):
@@ -76,9 +142,7 @@ class ViTEncoder(nn.Module):
 
 
 class _DatasetSplit(torch.utils.data.Dataset):
-    """
-    Internal dataset class used by DatasetManager.
-    """
+    """Internal dataset class used by DatasetManager."""
     def __init__(self, data_dir, split, V=1, img_size=128, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
         self.V = V
         self.img_size = img_size
@@ -122,10 +186,8 @@ class _DatasetSplit(torch.utils.data.Dataset):
 
 
 class DatasetManager:
-    """
-    Manager class responsible for extraction and spawning dataset splits.
-    """
-    def __init__(self, archive_path, working_dir="/kaggle/working/imagenette-160"):
+    """Manager class responsible for extraction and spawning dataset splits."""
+    def __init__(self, archive_path, working_dir):
         self.working_dir = working_dir
         
         # Extraction logic
@@ -141,9 +203,7 @@ class DatasetManager:
             print(f"Data already found at {self.working_dir}")
 
     def get_ds(self, split, V, img_size=128, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
-        """
-        Factory method to return the actual Dataset object.
-        """
+        """Factory method to return the actual Dataset object."""
         return _DatasetSplit(self.working_dir, split, V, img_size, mean, std)
 
 
@@ -199,44 +259,27 @@ def validate(net, probe, test_dl, device, use_amp, amp_dtype):
     return correct / total
 
 
-def main(cfg: DictConfig):
-    # Configuration validation
-    assert cfg.bs > 0, "Batch size must be positive"
-    assert cfg.V >= 1, "Number of views must be at least 1"
-    assert cfg.accum_steps > 0, "Accumulation steps must be positive"
-    effective_bs = cfg.bs * cfg.accum_steps
-    assert effective_bs <= 512, f"Effective batch size ({effective_bs}) too large, reduce bs or accum_steps"
+def main(config: TrainingConfig):
+    """Main training function."""
+    # Print configuration
+    config.print_config()
     
     torch.manual_seed(0)
-    
-    print(f"\n{'='*60}")
-    print("Training Configuration:")
-    print(f"  Device: {device}")
-    print(f"  Batch Size: {cfg.bs}")
-    print(f"  Accumulation Steps: {cfg.accum_steps}")
-    print(f"  Effective Batch Size: {effective_bs}")
-    print(f"  Views per image: {cfg.V}")
-    print(f"  Epochs: {cfg.epochs}")
-    print(f"  Learning Rate: {cfg.lr}")
-    print(f"  Lambda: {cfg.lamb}")
-    print(f"  Projection Dim: {cfg.proj_dim}")
-    print(f"{'='*60}\n")
 
     # Initialize Dataset Manager
-    archive_path = "/kaggle/input/imagenette-160-px/imagenette-160.tgz"
-    dataset_manager = DatasetManager(archive_path)
+    dataset_manager = DatasetManager(config.archive_path, config.working_dir)
 
     # Get PyTorch Datasets
-    train_ds = dataset_manager.get_ds(split="train", V=cfg.V)
-    test_ds = dataset_manager.get_ds(split="validation", V=1)
+    train_ds = dataset_manager.get_ds(split="train", V=config.V, img_size=config.img_size)
+    test_ds = dataset_manager.get_ds(split="validation", V=1, img_size=config.img_size)
     
     # DataLoaders with improved settings
     train_dl = DataLoader(
         train_ds, 
-        batch_size=cfg.bs, 
+        batch_size=config.bs, 
         shuffle=True, 
         drop_last=True, 
-        num_workers=4, 
+        num_workers=config.num_workers, 
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2
@@ -244,18 +287,18 @@ def main(cfg: DictConfig):
     test_dl = DataLoader(
         test_ds, 
         batch_size=256, 
-        num_workers=4, 
+        num_workers=config.num_workers, 
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2
     )
 
     # Modules and loss
-    net = ViTEncoder(proj_dim=cfg.proj_dim, dropout=0.1).to(device)
+    net = ViTEncoder(proj_dim=config.proj_dim, dropout=config.dropout).to(device)
     probe = nn.Sequential(
         nn.LayerNorm(512),
-        nn.Dropout(0.1),
-        nn.Linear(512, 10)
+        nn.Dropout(config.dropout),
+        nn.Linear(512, config.num_classes)
     ).to(device)
     sigreg = SIGReg().to(device)
     
@@ -270,17 +313,17 @@ def main(cfg: DictConfig):
         print(f"Model compilation not available or failed: {e}")
     
     # Optimizer and scheduler
-    g1 = {"params": net.parameters(), "lr": cfg.lr, "weight_decay": 5e-2}
-    g2 = {"params": probe.parameters(), "lr": 1e-3, "weight_decay": 1e-7}
+    g1 = {"params": net.parameters(), "lr": config.lr, "weight_decay": config.weight_decay}
+    g2 = {"params": probe.parameters(), "lr": 1e-3, "weight_decay": config.probe_weight_decay}
     opt = torch.optim.AdamW([g1, g2])
     
     # Scheduler adjusted for gradient accumulation
-    steps_per_epoch = len(train_dl) // cfg.accum_steps
-    warmup_steps = steps_per_epoch  # warm up for 1 epoch
-    total_steps = steps_per_epoch * cfg.epochs
+    steps_per_epoch = len(train_dl) // config.accum_steps
+    warmup_steps = steps_per_epoch * config.warmup_epochs
+    total_steps = steps_per_epoch * config.epochs
 
     s1 = LinearLR(opt, start_factor=0.01, total_iters=warmup_steps)
-    s2 = CosineAnnealingLR(opt, T_max=total_steps - warmup_steps, eta_min=1e-6)
+    s2 = CosineAnnealingLR(opt, T_max=total_steps - warmup_steps, eta_min=config.min_lr)
     scheduler = SequentialLR(opt, schedulers=[s1, s2], milestones=[warmup_steps])
 
     scaler = GradScaler(enabled=use_amp)
@@ -288,20 +331,19 @@ def main(cfg: DictConfig):
     # Initialize logger
     logger = MetricsLogger()
     
-    print(f"Starting training for {cfg.epochs} epochs...")
+    print(f"Starting training for {config.epochs} epochs...")
     print(f"Steps per epoch: {steps_per_epoch}")
     print(f"Warmup steps: {warmup_steps}")
     print(f"Total optimization steps: {total_steps}\n")
     
     best_acc = 0.0
     patience = 0
-    max_patience = 20  # Early stopping patience
     
     # Training loop
-    for epoch in range(cfg.epochs):
+    for epoch in range(config.epochs):
         net.train()
         probe.train()
-        pbar = tqdm.tqdm(train_dl, total=len(train_dl), desc=f"Epoch {epoch+1}/{cfg.epochs}")
+        pbar = tqdm.tqdm(train_dl, total=len(train_dl), desc=f"Epoch {epoch+1}/{config.epochs}")
         
         opt.zero_grad()
         epoch_loss = 0.0
@@ -317,46 +359,46 @@ def main(cfg: DictConfig):
                 emb, proj = net(vs)
                 inv_loss = (proj.mean(0) - proj).square().mean()
                 sigreg_loss = sigreg(proj)
-                lejepa_loss = sigreg_loss * cfg.lamb + inv_loss * (1 - cfg.lamb)
+                lejepa_loss = sigreg_loss * config.lamb + inv_loss * (1 - config.lamb)
                 
                 # Dynamic repeat based on actual views
                 y_rep = y.repeat_interleave(vs.shape[1])
                 
                 # Linear probing with detached embeddings
                 yhat = probe(emb.detach())
-                probe_loss = F.cross_entropy(yhat, y_rep, label_smoothing=0.1)
+                probe_loss = F.cross_entropy(yhat, y_rep, label_smoothing=config.label_smoothing)
                 
                 loss = lejepa_loss + probe_loss
                 
                 # Normalize loss for gradient accumulation
-                loss = loss / cfg.accum_steps
+                loss = loss / config.accum_steps
 
             scaler.scale(loss).backward()
             
             # Accumulate metrics
-            epoch_loss += loss.item() * cfg.accum_steps
+            epoch_loss += loss.item() * config.accum_steps
             epoch_lejepa_loss += lejepa_loss.item()
             epoch_probe_loss += probe_loss.item()
             n_batches += 1
 
             # Optimizer step with gradient clipping
-            if (batch_idx + 1) % cfg.accum_steps == 0 or (batch_idx + 1) == len(train_dl):
+            if (batch_idx + 1) % config.accum_steps == 0 or (batch_idx + 1) == len(train_dl):
                 # Gradient clipping
                 scaler.unscale_(opt)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     list(net.parameters()) + list(probe.parameters()), 
-                    max_norm=1.0
+                    max_norm=config.max_grad_norm
                 )
                 
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad()
-                scheduler.step()  # Step scheduler after optimizer step
+                scheduler.step()
                 
                 # Update progress bar
                 current_lr = scheduler.get_last_lr()[0]
                 pbar.set_postfix({
-                    'loss': f'{loss.item() * cfg.accum_steps:.4f}',
+                    'loss': f'{loss.item() * config.accum_steps:.4f}',
                     'lr': f'{current_lr:.6f}',
                     'grad': f'{grad_norm:.2f}'
                 })
@@ -393,7 +435,7 @@ def main(cfg: DictConfig):
                 'optimizer_state_dict': opt.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'scaler_state_dict': scaler.state_dict(),
-                'config': dict(cfg),
+                'config': asdict(config),
                 'epoch': epoch,
                 'best_accuracy': best_acc,
                 'metrics': logger.metrics
@@ -401,10 +443,10 @@ def main(cfg: DictConfig):
             torch.save(checkpoint, "best_model.pth")
         else:
             patience += 1
-            print(f"No improvement. Patience: {patience}/{max_patience}")
+            print(f"No improvement. Patience: {patience}/{config.patience}")
         
         # Early stopping
-        if patience >= max_patience:
+        if patience >= config.patience:
             print(f"\nEarly stopping triggered after {epoch+1} epochs")
             break
         
@@ -420,7 +462,7 @@ def main(cfg: DictConfig):
         'optimizer_state_dict': opt.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'scaler_state_dict': scaler.state_dict(),
-        'config': dict(cfg),
+        'config': asdict(config),
         'epoch': epoch,
         'final_accuracy': acc,
         'best_accuracy': best_acc,
@@ -436,18 +478,19 @@ def main(cfg: DictConfig):
 
 
 if __name__ == "__main__":
-    # Hydra composition for script/notebook usage
-    with initialize(version_base=None, config_path=None):
-        overrides = [
-            "+lamb=0.02",
-            "+V=4",
-            "+proj_dim=16",
-            "+lr=2e-3",
-            "+bs=16",
-            "+accum_steps=16",
-            "+epochs=2"
-        ]
-        cfg = compose(config_name=None, overrides=overrides)
-        
-        print(f"Configuration:\n{cfg}")
-        main(cfg)
+    # Create configuration with custom parameters
+    config = TrainingConfig(
+        lamb=0.02,
+        V=4,
+        proj_dim=16,
+        lr=2e-3,
+        bs=16,
+        accum_steps=16,
+        epochs=2
+    )
+    
+    # You can also override specific parameters like this:
+    # config.epochs = 100
+    # config.patience = 30
+    
+    main(config)
