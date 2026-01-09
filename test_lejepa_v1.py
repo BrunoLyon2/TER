@@ -63,7 +63,7 @@ class ViTEncoder(nn.Module):
 
 class _DatasetSplit(torch.utils.data.Dataset):
     """
-    Internal dataset class used by HFDataset manager.
+    Internal dataset class used by DatasetManager.
     """
     def __init__(self, data_dir, split, V=1):
         self.V = V
@@ -107,7 +107,7 @@ class _DatasetSplit(torch.utils.data.Dataset):
         return len(self.ds)
 
 
-class HFDataset:
+class DatasetManager:
     """
     Manager class responsible for extraction and spawning dataset splits.
     """
@@ -139,7 +139,7 @@ def main(cfg: DictConfig):
     # Initialize Dataset Manager
     # Note: Ensure this path matches your Kaggle input path
     archive_path = "/kaggle/input/imagenette-160-px/imagenette-160.tgz"
-    dataset_manager = HFDataset(archive_path)
+    dataset_manager = DatasetManager(archive_path)
 
     # Get PyTorch Datasets
     train_ds = dataset_manager.get_ds(split="train", V=cfg.V)
