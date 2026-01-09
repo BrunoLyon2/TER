@@ -1,4 +1,6 @@
+
 import os
+import sys
 import shutil
 import tarfile
 from dataclasses import dataclass, asdict
@@ -16,6 +18,63 @@ from torchvision.ops import MLP
 import mlflow
 import mlflow.data # Explicit import for clarity, though accessible via mlflow
 import numpy as np
+
+# Initialize DATABRICKS_MLEXPE globally to avoid NameError if not set by setup_environment
+# or if setup_environment fails. It provides a default empty string.
+DATABRICKS_MLEXPE = ""
+
+# -----------------------------------------------------------------------------
+# Platform Detection & Secret Management
+# -----------------------------------------------------------------------------
+def setup_environment():
+    """
+    Detects if running on Kaggle or Colab and sets up Databricks credentials
+    from their respective Secret managers.
+    """
+    print("Detecting environment...")
+
+    # 1. Kaggle Detection
+    if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:
+        print(">> Detected Kaggle Environment")
+        try:
+            from kaggle_secrets import UserSecretsClient
+            user_secrets = UserSecretsClient()
+            os.environ["DATABRICKS_HOST"] = user_secrets.get_secret("DATABRICKS_HOST")
+            os.environ["DATABRICKS_TOKEN"] = user_secrets.get_secret("DATABRICKS_TOKEN")
+            global DATABRICKS_MLEXPE # Declare global to assign
+            # Assuming DATABRICKS_MLEXPE might be a secret on Kaggle too
+            DATABRICKS_MLEXPE = user_secrets.get_secret("DATABRICKS_MLEXPE", default="")
+            os.environ["MLFLOW_TRACKING_URI"] = "databricks"
+            print("   Success: Retrieved secrets via kaggle_secrets.")
+        except Exception as e:
+            print(f"   Warning: Could not set secrets via Kaggle. Error: {e}")
+            print("   Ensure 'DATABRICKS_HOST' and 'DATABRICKS_TOKEN' are in Add-ons -> Secrets.")
+
+    # 2. Google Colab Detection
+    elif "COLAB_RELEASE_TAG" in os.environ or "google.colab" in sys.modules:
+        print(">> Detected Google Colab Environment")
+        try:
+            from google.colab import userdata
+            os.environ["DATABRICKS_HOST"] = userdata.get("DATABRICKS_HOST")
+            os.environ["DATABRICKS_TOKEN"] = userdata.get("DATABRICKS_TOKEN")
+            global DATABRICKS_MLEXPE # Declare global to assign
+            DATABRICKS_MLEXPE = userdata.get("DATABRICKS_MLEXPE") # Assign value to the global variable
+            os.environ["MLFLOW_TRACKING_URI"] = "databricks"
+            print("   Success: Retrieved secrets via google.colab.userdata.")
+        except Exception as e:
+            print(f"   Warning: Could not set secrets via Colab. Error: {e}")
+            print("   Ensure 'DATABRICKS_HOST' and 'DATABRICKS_TOKEN' are in the Secrets tab (key icon).")
+
+    # 3. Local/Other
+    else:
+        print(">> Detected Local/Generic Environment")
+        if "DATABRICKS_TOKEN" not in os.environ:
+            print("   Warning: DATABRICKS_TOKEN not found in env vars. MLflow might fail to log to remote.")
+
+# Call setup_environment here, at the global scope, after its definition.
+# This ensures DATABRICKS_MLEXPE is populated before TrainingConfig is instantiated.
+setup_environment()
+
 
 # Setup device according to local hardware
 if torch.cuda.is_available():
@@ -626,14 +685,8 @@ def main(config: TrainingConfig):
 if __name__ == "__main__":
     # Create configuration with custom parameters
     config = TrainingConfig(
-        lamb=0.02,
-        V=4,
-        proj_dim=16,
-        lr=2e-3,
-        bs=16,
-        accum_steps=16,
         epochs=2,
-        mlflow_experiment="LejEPA_Experiment" # Databricks Experiment Name
+        mlflow_experiment=DATABRICKS_MLEXPE # Databricks Experiment Name
     )
     
     # You can also override specific parameters like this:
