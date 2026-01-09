@@ -14,6 +14,8 @@ from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torchvision.ops import MLP
 import mlflow
+import mlflow.data # Explicit import for clarity, though accessible via mlflow
+import numpy as np
 
 # Setup device according to local hardware
 if torch.cuda.is_available():
@@ -151,6 +153,26 @@ class ViTEncoder(nn.Module):
         N, V = x.shape[:2]
         emb = self.backbone(x.flatten(0, 1))
         return emb, self.proj(emb).reshape(N, V, -1).transpose(0, 1)
+
+
+class InferenceModel(nn.Module):
+    """
+    Wrapper model for deployment/inference.
+    Accepts standard 4D image batch [B, C, H, W] and returns class logits.
+    """
+    def __init__(self, net, probe):
+        super().__init__()
+        self.net = net
+        self.probe = probe
+        
+    def forward(self, x):
+        # ViTEncoder expects 5D input [B, Views, C, H, W].
+        # For standard inference, we assume 1 View.
+        if x.ndim == 4:
+            x = x.unsqueeze(1)
+            
+        emb, _ = self.net(x)
+        return self.probe(emb)
 
 
 class _DatasetSplit(torch.utils.data.Dataset):
@@ -292,6 +314,7 @@ def main(config: TrainingConfig):
     dataset_manager = DatasetManager(config.archive_path, config.data_dir)
 
     # Get PyTorch Datasets
+    # Note: We access the underlying HF dataset object for MLflow logging using .ds
     train_ds = dataset_manager.get_ds(split="train", V=config.V, img_size=config.img_size)
     test_ds = dataset_manager.get_ds(split="validation", V=1, img_size=config.img_size)
     
@@ -383,6 +406,29 @@ def main(config: TrainingConfig):
         # Log all configuration parameters
         mlflow.log_params(asdict(config))
         
+        # --- Log Data Lineage ---
+        try:
+            # Create MLflow dataset from the underlying Hugging Face dataset
+            train_set_mlflow = mlflow.data.from_huggingface(
+                train_ds.ds, 
+                path=config.archive_path, 
+                name="imagenette_train"
+            )
+            mlflow.log_input(train_set_mlflow, context="training")
+            print("Logged training dataset info (lineage) to MLflow.")
+        except Exception as e:
+            print(f"Warning: Failed to log dataset info: {e}")
+
+        # --- Pre-generate example input for MLflow Signature ---
+        try:
+            example_input_tensor = torch.randn(1, 3, config.img_size, config.img_size, device=device)
+            example_input = example_input_tensor.detach().cpu().numpy()
+            print("Generated example input for MLflow signature.")
+        except Exception as e:
+            print(f"Warning: Failed to generate example input: {e}")
+            example_input = None
+            example_input_tensor = None
+
         # Training loop
         for epoch in range(config.epochs):
             net.train()
@@ -490,6 +536,8 @@ def main(config: TrainingConfig):
                 best_acc = acc
                 patience = 0
                 print(f"✓ New best accuracy: {best_acc:.4f}. Saving best model...")
+                
+                # 1. Save resumable checkpoint (Dictionary)
                 checkpoint = {
                     'net_state_dict': net.state_dict() if not hasattr(net, '_orig_mod') else net._orig_mod.state_dict(),
                     'probe_state_dict': probe.state_dict() if not hasattr(probe, '_orig_mod') else probe._orig_mod.state_dict(),
@@ -502,9 +550,34 @@ def main(config: TrainingConfig):
                     'metrics': logger.metrics
                 }
                 torch.save(checkpoint, "best_model.pth")
-                
-                # ---- Log Artifact to MLflow ----
                 mlflow.log_artifact("best_model.pth")
+                
+                # 2. Log deployment-ready model with signature
+                if example_input_tensor is not None:
+                    try:
+                        # Wrap modules
+                        inference_model = InferenceModel(
+                            net._orig_mod if hasattr(net, '_orig_mod') else net,
+                            probe._orig_mod if hasattr(probe, '_orig_mod') else probe
+                        )
+                        inference_model.eval()
+                        
+                        # Generate output for signature using current best model
+                        with torch.no_grad():
+                            # InferenceModel handles the 4D -> 5D conversion
+                            example_output = inference_model(example_input_tensor).detach().cpu().numpy()
+                        
+                        signature = mlflow.models.infer_signature(example_input, example_output)
+                        
+                        mlflow.pytorch.log_model(
+                            inference_model,
+                            "deployment_model",
+                            signature=signature,
+                            input_example=example_input
+                        )
+                        print("Logged deployment_model with signature to MLflow.")
+                    except Exception as e:
+                        print(f"Warning: Failed to log model with signature: {e}")
                 
             else:
                 patience += 1
@@ -553,8 +626,14 @@ def main(config: TrainingConfig):
 if __name__ == "__main__":
     # Create configuration with custom parameters
     config = TrainingConfig(
+        lamb=0.02,
+        V=4,
+        proj_dim=16,
+        lr=2e-3,
+        bs=16,
+        accum_steps=16,
         epochs=2,
-        mlflow_experiment="My_Lejepa_v1" # Databricks Experiment Name
+        mlflow_experiment="LejEPA_Experiment" # Databricks Experiment Name
     )
     
     # You can also override specific parameters like this:
