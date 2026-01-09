@@ -42,7 +42,9 @@ class TrainingConfig:
     lamb: float = 0.02              # Balance between SigReg and invariance loss
     V: int = 4                      # Number of augmented views per image
     proj_dim: int = 16              # Projection dimension
-    dropout: float = 0.1            # Dropout rate
+    drop_path_rate: float = 0.1     # Stochastic depth rate for ViT backbone
+    proj_dropout: float = 0.1       # Dropout rate for projection MLP
+    probe_dropout: float = 0.1      # Dropout rate for linear probe
     
     # Training hyperparameters
     lr: float = 2e-3                # Learning rate
@@ -84,7 +86,9 @@ class TrainingConfig:
         assert effective_bs <= 512, f"Effective batch size ({effective_bs}) too large"
         
         assert 0 <= self.lamb <= 1, "Lambda must be between 0 and 1"
-        assert self.dropout >= 0, "Dropout must be non-negative"
+        assert 0 <= self.drop_path_rate <= 1, "Drop path rate must be between 0 and 1"
+        assert 0 <= self.proj_dropout <= 1, "Projection dropout must be between 0 and 1"
+        assert 0 <= self.probe_dropout <= 1, "Probe dropout must be between 0 and 1"
     
     @property
     def effective_batch_size(self):
@@ -124,16 +128,16 @@ class SIGReg(torch.nn.Module):
 
 
 class ViTEncoder(nn.Module):
-    def __init__(self, proj_dim=128, dropout=0.1):
+    def __init__(self, proj_dim=128, drop_path_rate=0.1, proj_dropout=0.1, img_size=128):
         super().__init__()
         self.backbone = timm.create_model(
             "vit_small_patch8_224",
             pretrained=False,
             num_classes=512,
-            drop_path_rate=0.1,
-            img_size=128,
+            drop_path_rate=drop_path_rate,
+            img_size=img_size,
         )
-        self.proj = MLP(512, [2048, 2048, proj_dim], norm_layer=nn.BatchNorm1d, dropout=dropout)
+        self.proj = MLP(512, [2048, 2048, proj_dim], norm_layer=nn.BatchNorm1d, dropout=proj_dropout)
 
     def forward(self, x):
         N, V = x.shape[:2]
@@ -294,10 +298,15 @@ def main(config: TrainingConfig):
     )
 
     # Modules and loss
-    net = ViTEncoder(proj_dim=config.proj_dim, dropout=config.dropout).to(device)
+    net = ViTEncoder(
+        proj_dim=config.proj_dim, 
+        drop_path_rate=config.drop_path_rate,
+        proj_dropout=config.proj_dropout,
+        img_size=config.img_size
+    ).to(device)
     probe = nn.Sequential(
         nn.LayerNorm(512),
-        nn.Dropout(config.dropout),
+        nn.Dropout(config.probe_dropout),
         nn.Linear(512, config.num_classes)
     ).to(device)
     sigreg = SIGReg().to(device)
