@@ -1,4 +1,5 @@
 import os
+import shutil
 import tarfile
 from dataclasses import dataclass, asdict
 import torch
@@ -78,10 +79,10 @@ class TrainingConfig:
     
     # Paths
     archive_path: str = "/kaggle/input/imagenette-160-px/imagenette-160.tgz"
-    working_dir: str = "/kaggle/working/imagenette-160"
+    data_dir: str = "/kaggle/working/imagenette-160"
     
     # MLflow
-    mlflow_experiment: str = "My_Lejepa_v1" # Name of the experiment in Databricks/MLflow
+    mlflow_experiment: str = "LejEPA_Experiment" # Name of the experiment in Databricks/MLflow
     
     def __post_init__(self):
         """Validate configuration."""
@@ -198,24 +199,34 @@ class _DatasetSplit(torch.utils.data.Dataset):
 
 class DatasetManager:
     """Manager class responsible for extraction and spawning dataset splits."""
-    def __init__(self, archive_path, working_dir):
-        self.working_dir = working_dir
+    def __init__(self, archive_path, data_dir):
+        self.data_dir = data_dir
         
         # Extraction logic
-        if not os.path.exists(self.working_dir):
+        if not os.path.exists(self.data_dir):
             if os.path.exists(archive_path):
-                print(f"Extracting {archive_path} to {os.path.dirname(self.working_dir)}...")
+                print(f"Extracting {archive_path} to {os.path.dirname(self.data_dir)}...")
                 with tarfile.open(archive_path, "r:gz") as tar:
-                    tar.extractall(path=os.path.dirname(self.working_dir))
+                    tar.extractall(path=os.path.dirname(self.data_dir))
                 print("Extraction complete.")
             else:
-                print(f"Warning: Archive not found at {archive_path}. Attempting to load from {self.working_dir} anyway.")
+                print(f"Warning: Archive not found at {archive_path}. Attempting to load from {self.data_dir} anyway.")
         else:
-            print(f"Data already found at {self.working_dir}")
+            print(f"Data already found at {self.data_dir}")
 
     def get_ds(self, split, V, img_size=128, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
         """Factory method to return the actual Dataset object."""
-        return _DatasetSplit(self.working_dir, split, V, img_size, mean, std)
+        return _DatasetSplit(self.data_dir, split, V, img_size, mean, std)
+
+    def cleanup(self):
+        """Remove the extracted dataset directory."""
+        if os.path.exists(self.data_dir):
+            print(f"Cleaning up dataset directory: {self.data_dir}...")
+            try:
+                shutil.rmtree(self.data_dir)
+                print("Cleanup complete.")
+            except Exception as e:
+                print(f"Error during cleanup: {e}")
 
 
 class MetricsLogger:
@@ -278,7 +289,7 @@ def main(config: TrainingConfig):
     torch.manual_seed(0)
 
     # Initialize Dataset Manager
-    dataset_manager = DatasetManager(config.archive_path, config.working_dir)
+    dataset_manager = DatasetManager(config.archive_path, config.data_dir)
 
     # Get PyTorch Datasets
     train_ds = dataset_manager.get_ds(split="train", V=config.V, img_size=config.img_size)
@@ -533,6 +544,10 @@ def main(config: TrainingConfig):
         print(f"Best Validation Accuracy: {best_acc:.4f}")
         print(f"Final Validation Accuracy: {acc:.4f}")
         print(f"{'='*60}\n")
+    
+    # ---------------- Cleanup ----------------
+    # Remove the extracted dataset directory to keep Kaggle output clean
+    dataset_manager.cleanup()
 
 
 if __name__ == "__main__":
