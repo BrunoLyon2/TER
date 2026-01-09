@@ -14,6 +14,14 @@ from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torchvision.ops import MLP
 
+# Setup device according to local hardware
+if torch.cuda.is_available():
+    device = "cuda"
+elif torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = "cpu"
+
 class SIGReg(torch.nn.Module):
     def __init__(self, knots=17):
         super().__init__()
@@ -27,7 +35,7 @@ class SIGReg(torch.nn.Module):
         self.register_buffer("weights", weights * window)
 
     def forward(self, proj):
-        A = torch.randn(proj.size(-1), 256, device="cuda")
+        A = torch.randn(proj.size(-1), 256, device=device)
         A = A.div_(A.norm(p=2, dim=0))
         x_t = (proj @ A).unsqueeze(-1) * self.t
         err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
@@ -144,9 +152,9 @@ def main(cfg: DictConfig):
     test_dl = DataLoader(test_ds, batch_size=256, num_workers=4, pin_memory=True)
 
     # modules and loss
-    net = ViTEncoder(proj_dim=cfg.proj_dim).to("cuda")
-    probe = nn.Sequential(nn.LayerNorm(512), nn.Linear(512, 10)).to("cuda") # Changed 100 to 10 for Imagenette (10 classes)
-    sigreg = SIGReg().to("cuda")
+    net = ViTEncoder(proj_dim=cfg.proj_dim).to(device)
+    probe = nn.Sequential(nn.LayerNorm(512), nn.Linear(512, 10)).to(device) # Changed 100 to 10 for Imagenette (10 classes)
+    sigreg = SIGReg().to(device)
     
     # Optimizer and scheduler
     g1 = {"params": net.parameters(), "lr": cfg.lr, "weight_decay": 5e-2}
@@ -179,11 +187,10 @@ def main(cfg: DictConfig):
         opt.zero_grad() # Ensure grads are zero before starting the epoch
         
         for batch_idx, (vs, y) in enumerate(pbar):
-            # FIXME: adapt automaticly or put it in parameters
             # Changed from bfloat16 to float16 for P100 compatibility
-            with autocast("cuda", dtype=torch.float16):
-                vs = vs.to("cuda", non_blocking=True)
-                y = y.to("cuda", non_blocking=True)
+            with autocast(device, dtype=torch.float16):
+                vs = vs.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
                 
                 emb, proj = net(vs)
                 inv_loss = (proj.mean(0) - proj).square().mean()
@@ -222,11 +229,11 @@ def main(cfg: DictConfig):
         total = 0
         with torch.inference_mode():
             for vs, y in test_dl:
-                vs = vs.to("cuda", non_blocking=True)
-                y = y.to("cuda", non_blocking=True)
+                vs = vs.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
                 # FIXME: adapt automaticly or put it in parameters
                 # Changed from bfloat16 to float16 for P100 compatibility
-                with autocast("cuda", dtype=torch.float16):
+                with autocast(device, dtype=torch.float16):
                     # For eval, vs shape is [Batch, 1, Channels, Height, Width]
                     # We pass this 5D tensor directly to ViTEncoder.
                     # It will parse N, V correctly and flatten internally to [Batch*1, C, H, W]
