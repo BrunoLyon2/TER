@@ -12,6 +12,7 @@ from datasets import load_dataset
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torchvision.ops import MLP
+import mlflow
 
 # Setup device according to local hardware
 if torch.cuda.is_available():
@@ -78,6 +79,9 @@ class TrainingConfig:
     # Paths
     archive_path: str = "/kaggle/input/imagenette-160-px/imagenette-160.tgz"
     working_dir: str = "/kaggle/working/imagenette-160"
+    
+    # MLflow
+    mlflow_experiment: str = "My_Lejepa_v1" # Name of the experiment in Databricks/MLflow
     
     def __post_init__(self):
         """Validate configuration."""
@@ -355,155 +359,187 @@ def main(config: TrainingConfig):
     
     best_acc = 0.0
     patience = 0
+    global_step = 0
     
-    # Training loop
-    for epoch in range(config.epochs):
-        net.train()
-        probe.train()
-        pbar = tqdm.tqdm(train_dl, total=len(train_dl), desc=f"Epoch {epoch+1}/{config.epochs}")
-        
-        opt.zero_grad()
-        epoch_loss = 0.0
-        epoch_lejepa_loss = 0.0
-        epoch_probe_loss = 0.0
-        n_batches = 0
-        
-        for batch_idx, (vs, y) in enumerate(pbar):
-            with autocast(device, dtype=amp_dtype, enabled=use_amp):
-                vs = vs.to(device, non_blocking=True)
-                y = y.to(device, non_blocking=True)
-                
-                emb, proj = net(vs)
-                inv_loss = (proj.mean(0) - proj).square().mean()
-                sigreg_loss = sigreg(proj)
-                lejepa_loss = sigreg_loss * config.lamb + inv_loss * (1 - config.lamb)
-                
-                # Dynamic repeat based on actual views
-                y_rep = y.repeat_interleave(vs.shape[1])
-                
-                # Linear probing with detached embeddings
-                yhat = probe(emb.detach())
-                probe_loss = F.cross_entropy(yhat, y_rep, label_smoothing=config.label_smoothing)
-                
-                loss = lejepa_loss + probe_loss
-                
-                # Normalize loss for gradient accumulation
-                loss = loss / config.accum_steps
+    # ---------------- Setup MLflow ----------------
+    try:
+        mlflow.set_experiment(config.mlflow_experiment)
+        print(f"MLflow experiment set to: {config.mlflow_experiment}")
+    except Exception as e:
+        print(f"Note: Could not explicitly set MLflow experiment (might be running in a notebook with default exp). Error: {e}")
 
-            scaler.scale(loss).backward()
+    with mlflow.start_run():
+        # Log all configuration parameters
+        mlflow.log_params(asdict(config))
+        
+        # Training loop
+        for epoch in range(config.epochs):
+            net.train()
+            probe.train()
+            pbar = tqdm.tqdm(train_dl, total=len(train_dl), desc=f"Epoch {epoch+1}/{config.epochs}")
             
-            # Accumulate metrics
-            epoch_loss += loss.item() * config.accum_steps
-            epoch_lejepa_loss += lejepa_loss.item()
-            epoch_probe_loss += probe_loss.item()
-            n_batches += 1
+            opt.zero_grad()
+            epoch_loss = 0.0
+            epoch_lejepa_loss = 0.0
+            epoch_probe_loss = 0.0
+            n_batches = 0
+            
+            for batch_idx, (vs, y) in enumerate(pbar):
+                with autocast(device, dtype=amp_dtype, enabled=use_amp):
+                    vs = vs.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
+                    
+                    emb, proj = net(vs)
+                    inv_loss = (proj.mean(0) - proj).square().mean()
+                    sigreg_loss = sigreg(proj)
+                    lejepa_loss = sigreg_loss * config.lamb + inv_loss * (1 - config.lamb)
+                    
+                    # Dynamic repeat based on actual views
+                    y_rep = y.repeat_interleave(vs.shape[1])
+                    
+                    # Linear probing with detached embeddings
+                    yhat = probe(emb.detach())
+                    probe_loss = F.cross_entropy(yhat, y_rep, label_smoothing=config.label_smoothing)
+                    
+                    loss = lejepa_loss + probe_loss
+                    
+                    # Normalize loss for gradient accumulation
+                    loss = loss / config.accum_steps
 
-            # Optimizer step with gradient clipping
-            if (batch_idx + 1) % config.accum_steps == 0 or (batch_idx + 1) == len(train_dl):
-                # Gradient clipping
-                scaler.unscale_(opt)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    list(net.parameters()) + list(probe.parameters()), 
-                    max_norm=config.max_grad_norm
-                )
+                scaler.scale(loss).backward()
                 
-                scaler.step(opt)
-                scaler.update()
-                opt.zero_grad()
-                scheduler.step()
+                # Accumulate metrics
+                epoch_loss += loss.item() * config.accum_steps
+                epoch_lejepa_loss += lejepa_loss.item()
+                epoch_probe_loss += probe_loss.item()
+                n_batches += 1
+
+                # Optimizer step with gradient clipping
+                if (batch_idx + 1) % config.accum_steps == 0 or (batch_idx + 1) == len(train_dl):
+                    # Gradient clipping
+                    scaler.unscale_(opt)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        list(net.parameters()) + list(probe.parameters()), 
+                        max_norm=config.max_grad_norm
+                    )
+                    
+                    scaler.step(opt)
+                    scaler.update()
+                    opt.zero_grad()
+                    scheduler.step()
+                    
+                    # Update progress bar
+                    current_lr = scheduler.get_last_lr()[0]
+                    pbar.set_postfix({
+                        'loss': f'{loss.item() * config.accum_steps:.4f}',
+                        'lr': f'{current_lr:.6f}',
+                        'grad': f'{grad_norm:.2f}'
+                    })
+                    
+                    # ---- Log Step Metrics to MLflow ----
+                    mlflow.log_metrics({
+                        'train_batch_loss': loss.item() * config.accum_steps,
+                        'train_lejepa_loss': lejepa_loss.item(),
+                        'train_probe_loss': probe_loss.item(),
+                        'lr': current_lr,
+                        'grad_norm': grad_norm.item()
+                    }, step=global_step)
+                    
+                    global_step += 1
+
+            # Calculate epoch averages
+            avg_loss = epoch_loss / n_batches
+            avg_lejepa = epoch_lejepa_loss / n_batches
+            avg_probe = epoch_probe_loss / n_batches
+            current_lr = scheduler.get_last_lr()[0]
+
+            # Validation
+            print(f"\nRunning validation...")
+            acc = validate(net, probe, test_dl, device, use_amp, amp_dtype)
+            
+            # Log metrics (Local Logger)
+            logger.log(
+                epoch=epoch+1,
+                train_loss=avg_loss,
+                train_lejepa_loss=avg_lejepa,
+                train_probe_loss=avg_probe,
+                val_acc=acc,
+                lr=current_lr
+            )
+            logger.print_summary(epoch+1)
+            
+            # ---- Log Epoch Metrics to MLflow ----
+            mlflow.log_metrics({
+                'train_epoch_loss': avg_loss,
+                'val_acc': acc
+            }, step=global_step)
+
+            # Save best model
+            if acc > best_acc:
+                best_acc = acc
+                patience = 0
+                print(f"✓ New best accuracy: {best_acc:.4f}. Saving best model...")
+                checkpoint = {
+                    'net_state_dict': net.state_dict() if not hasattr(net, '_orig_mod') else net._orig_mod.state_dict(),
+                    'probe_state_dict': probe.state_dict() if not hasattr(probe, '_orig_mod') else probe._orig_mod.state_dict(),
+                    'optimizer_state_dict': opt.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'scaler_state_dict': scaler.state_dict(),
+                    'config': asdict(config),
+                    'epoch': epoch,
+                    'best_accuracy': best_acc,
+                    'metrics': logger.metrics
+                }
+                torch.save(checkpoint, "best_model.pth")
                 
-                # Update progress bar
-                current_lr = scheduler.get_last_lr()[0]
-                pbar.set_postfix({
-                    'loss': f'{loss.item() * config.accum_steps:.4f}',
-                    'lr': f'{current_lr:.6f}',
-                    'grad': f'{grad_norm:.2f}'
-                })
+                # ---- Log Artifact to MLflow ----
+                mlflow.log_artifact("best_model.pth")
+                
+            else:
+                patience += 1
+                print(f"No improvement. Patience: {patience}/{config.patience}")
+            
+            # Early stopping
+            if patience >= config.patience:
+                print(f"\nEarly stopping triggered after {epoch+1} epochs")
+                break
+            
+            # Clear cache periodically
+            if device == "cuda" and (epoch + 1) % 5 == 0:
+                torch.cuda.empty_cache()
 
-        # Calculate epoch averages
-        avg_loss = epoch_loss / n_batches
-        avg_lejepa = epoch_lejepa_loss / n_batches
-        avg_probe = epoch_probe_loss / n_batches
-        current_lr = scheduler.get_last_lr()[0]
-
-        # Validation
-        print(f"\nRunning validation...")
-        acc = validate(net, probe, test_dl, device, use_amp, amp_dtype)
+        # Save final model
+        print("\nSaving final model...")
+        final_filename = f"final_model_epoch_{epoch+1}_acc_{acc:.4f}.pth"
+        final_checkpoint = {
+            'net_state_dict': net.state_dict() if not hasattr(net, '_orig_mod') else net._orig_mod.state_dict(),
+            'probe_state_dict': probe.state_dict() if not hasattr(probe, '_orig_mod') else probe._orig_mod.state_dict(),
+            'optimizer_state_dict': opt.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'config': asdict(config),
+            'epoch': epoch,
+            'final_accuracy': acc,
+            'best_accuracy': best_acc,
+            'metrics': logger.metrics
+        }
+        torch.save(final_checkpoint, final_filename)
         
-        # Log metrics
-        logger.log(
-            epoch=epoch+1,
-            train_loss=avg_loss,
-            train_lejepa_loss=avg_lejepa,
-            train_probe_loss=avg_probe,
-            val_acc=acc,
-            lr=current_lr
-        )
-        logger.print_summary(epoch+1)
-
-        # Save best model
-        if acc > best_acc:
-            best_acc = acc
-            patience = 0
-            print(f"✓ New best accuracy: {best_acc:.4f}. Saving best model...")
-            checkpoint = {
-                'net_state_dict': net.state_dict() if not hasattr(net, '_orig_mod') else net._orig_mod.state_dict(),
-                'probe_state_dict': probe.state_dict() if not hasattr(probe, '_orig_mod') else probe._orig_mod.state_dict(),
-                'optimizer_state_dict': opt.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'scaler_state_dict': scaler.state_dict(),
-                'config': asdict(config),
-                'epoch': epoch,
-                'best_accuracy': best_acc,
-                'metrics': logger.metrics
-            }
-            torch.save(checkpoint, "best_model.pth")
-        else:
-            patience += 1
-            print(f"No improvement. Patience: {patience}/{config.patience}")
+        # ---- Log Final Artifact to MLflow ----
+        mlflow.log_artifact(final_filename)
         
-        # Early stopping
-        if patience >= config.patience:
-            print(f"\nEarly stopping triggered after {epoch+1} epochs")
-            break
-        
-        # Clear cache periodically
-        if device == "cuda" and (epoch + 1) % 5 == 0:
-            torch.cuda.empty_cache()
-
-    # Save final model
-    print("\nSaving final model...")
-    final_checkpoint = {
-        'net_state_dict': net.state_dict() if not hasattr(net, '_orig_mod') else net._orig_mod.state_dict(),
-        'probe_state_dict': probe.state_dict() if not hasattr(probe, '_orig_mod') else probe._orig_mod.state_dict(),
-        'optimizer_state_dict': opt.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'scaler_state_dict': scaler.state_dict(),
-        'config': asdict(config),
-        'epoch': epoch,
-        'final_accuracy': acc,
-        'best_accuracy': best_acc,
-        'metrics': logger.metrics
-    }
-    torch.save(final_checkpoint, f"final_model_epoch_{epoch+1}_acc_{acc:.4f}.pth")
-    
-    print(f"\n{'='*60}")
-    print("Training Complete!")
-    print(f"Best Validation Accuracy: {best_acc:.4f}")
-    print(f"Final Validation Accuracy: {acc:.4f}")
-    print(f"{'='*60}\n")
+        print(f"\n{'='*60}")
+        print("Training Complete!")
+        print(f"Best Validation Accuracy: {best_acc:.4f}")
+        print(f"Final Validation Accuracy: {acc:.4f}")
+        print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
     # Create configuration with custom parameters
     config = TrainingConfig(
-        lamb=0.02,
-        V=4,
-        proj_dim=16,
-        lr=2e-3,
-        bs=16,
-        accum_steps=16,
-        epochs=2
+        epochs=2,
+        mlflow_experiment="My_Lejepa_v1" # Databricks Experiment Name
     )
     
     # You can also override specific parameters like this:
