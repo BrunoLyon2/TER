@@ -1,6 +1,5 @@
 import os
 import shutil
-import tarfile
 from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
@@ -14,7 +13,7 @@ from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torchvision.ops import MLP
 import mlflow
-import mlflow.data # Explicit import for clarity, though accessible via mlflow
+import mlflow.data 
 import numpy as np
 
 # Setup device according to local hardware
@@ -79,9 +78,9 @@ class TrainingConfig:
     # Early stopping
     patience: int = 20              # Early stopping patience
     
-    # Paths
-    archive_path: str = "/kaggle/input/imagenette-160-px/imagenette-160.tgz"
-    data_dir: str = "/kaggle/working/imagenette-160"
+    # Dataset
+    dataset_name: str = "frgfm/imagenette"
+    dataset_config_name: str = "160px"
     
     # MLflow
     mlflow_experiment: str = "LejEPA_Experiment" # Name of the experiment in Databricks/MLflow
@@ -177,11 +176,13 @@ class InferenceModel(nn.Module):
 
 class _DatasetSplit(torch.utils.data.Dataset):
     """Internal dataset class used by DatasetManager."""
-    def __init__(self, data_dir, split, V=1, img_size=128, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
+    def __init__(self, dataset_name, config_name, split, V=1, img_size=128, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
         self.V = V
         self.img_size = img_size
-        # Load using imagefolder (automatically maps 'train'/'validation' folders)
-        self.ds = load_dataset("imagefolder", data_dir=data_dir, split=split)
+        
+        # Load directly from Hugging Face
+        # trust_remote_code=True is often required for community datasets like this
+        self.ds = load_dataset(dataset_name, config_name, split=split, trust_remote_code=True)
         
         self.aug = v2.Compose([
             v2.RandomResizedCrop(img_size, scale=(0.08, 1.0)),
@@ -220,35 +221,15 @@ class _DatasetSplit(torch.utils.data.Dataset):
 
 
 class DatasetManager:
-    """Manager class responsible for extraction and spawning dataset splits."""
-    def __init__(self, archive_path, data_dir):
-        self.data_dir = data_dir
-        
-        # Extraction logic
-        if not os.path.exists(self.data_dir):
-            if os.path.exists(archive_path):
-                print(f"Extracting {archive_path} to {os.path.dirname(self.data_dir)}...")
-                with tarfile.open(archive_path, "r:gz") as tar:
-                    tar.extractall(path=os.path.dirname(self.data_dir))
-                print("Extraction complete.")
-            else:
-                print(f"Warning: Archive not found at {archive_path}. Attempting to load from {self.data_dir} anyway.")
-        else:
-            print(f"Data already found at {self.data_dir}")
+    """Manager class responsible for loading dataset splits."""
+    def __init__(self, dataset_name, dataset_config_name):
+        self.dataset_name = dataset_name
+        self.dataset_config_name = dataset_config_name
 
     def get_ds(self, split, V, img_size=128, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
         """Factory method to return the actual Dataset object."""
-        return _DatasetSplit(self.data_dir, split, V, img_size, mean, std)
+        return _DatasetSplit(self.dataset_name, self.dataset_config_name, split, V, img_size, mean, std)
 
-    def cleanup(self):
-        """Remove the extracted dataset directory."""
-        if os.path.exists(self.data_dir):
-            print(f"Cleaning up dataset directory: {self.data_dir}...")
-            try:
-                shutil.rmtree(self.data_dir)
-                print("Cleanup complete.")
-            except Exception as e:
-                print(f"Error during cleanup: {e}")
 
 
 class MetricsLogger:
@@ -311,7 +292,7 @@ def main(config: TrainingConfig):
     torch.manual_seed(0)
 
     # Initialize Dataset Manager
-    dataset_manager = DatasetManager(config.archive_path, config.data_dir)
+    dataset_manager = DatasetManager(config.dataset_name, config.dataset_config_name)
 
     # Get PyTorch Datasets
     # Note: We access the underlying HF dataset object for MLflow logging using .ds
@@ -411,7 +392,7 @@ def main(config: TrainingConfig):
             # Create MLflow dataset from the underlying Hugging Face dataset
             train_set_mlflow = mlflow.data.from_huggingface(
                 train_ds.ds, 
-                path=config.archive_path, 
+                path=config.dataset_name, 
                 name="imagenette_train"
             )
             mlflow.log_input(train_set_mlflow, context="training")
@@ -618,21 +599,11 @@ def main(config: TrainingConfig):
         print(f"Final Validation Accuracy: {acc:.4f}")
         print(f"{'='*60}\n")
     
-    # ---------------- Cleanup ----------------
-    # Remove the extracted dataset directory to keep Kaggle output clean
-    dataset_manager.cleanup()
-
 
 if __name__ == "__main__":
     # Create configuration with custom parameters
     config = TrainingConfig(
-        lamb=0.02,
-        V=4,
-        proj_dim=16,
-        lr=2e-3,
-        bs=16,
-        accum_steps=16,
-        epochs=2,
+        epochs=20,
         mlflow_experiment="LejEPA_Experiment" # Databricks Experiment Name
     )
     
