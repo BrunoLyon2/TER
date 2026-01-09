@@ -16,9 +16,12 @@ from torchvision.ops import MLP
 # Setup device according to local hardware
 if torch.cuda.is_available():
     device = "cuda"
-    # Check GPU capability for mixed precision
+    # Check GPU capability for mixed precision and compilation
     gpu_capability = torch.cuda.get_device_capability()
-    use_amp = gpu_capability[0] >= 7  # Volta (V100) or newer
+    # P100 is capability 6.0. V100 is 7.0.
+    # AMP usually targets Tensor Cores (>=7.0), though Pascal supports FP16 math.
+    # We'll stick to your logic: enable AMP only if >= 7.0
+    use_amp = gpu_capability[0] >= 7  
     amp_dtype = torch.bfloat16 if gpu_capability[0] >= 8 else torch.float16
     print(f"GPU detected: {torch.cuda.get_device_name(0)}")
     print(f"Compute capability: {gpu_capability[0]}.{gpu_capability[1]}")
@@ -312,12 +315,17 @@ def main(config: TrainingConfig):
     sigreg = SIGReg().to(device)
     
     # Try torch.compile for PyTorch 2.0+
+    # Only attempted if GPU compute capability >= 7.0 (Triton requirement)
     try:
         if hasattr(torch, 'compile') and device == "cuda":
-            print("Compiling model with torch.compile...")
-            net = torch.compile(net)
-            probe = torch.compile(probe)
-            print("Model compilation successful!")
+            capability = torch.cuda.get_device_capability()
+            if capability[0] >= 7:
+                print("Compiling model with torch.compile...")
+                net = torch.compile(net)
+                probe = torch.compile(probe)
+                print("Model compilation successful!")
+            else:
+                print(f"Skipping torch.compile: GPU capability {capability[0]}.{capability[1]} < 7.0 (Triton requirement)")
     except Exception as e:
         print(f"Model compilation not available or failed: {e}")
     
