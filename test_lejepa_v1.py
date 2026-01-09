@@ -1,6 +1,6 @@
 import os
-import sys
 import shutil
+import tarfile
 from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
@@ -14,51 +14,8 @@ from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torchvision.ops import MLP
 import mlflow
-import mlflow.data 
+import mlflow.data # Explicit import for clarity, though accessible via mlflow
 import numpy as np
-
-# -----------------------------------------------------------------------------
-# Platform Detection & Secret Management
-# -----------------------------------------------------------------------------
-def setup_environment():
-    """
-    Detects if running on Kaggle or Colab and sets up Databricks credentials
-    from their respective Secret managers.
-    """
-    print("Detecting environment...")
-    
-    # 1. Kaggle Detection
-    if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:
-        print(">> Detected Kaggle Environment")
-        try:
-            from kaggle_secrets import UserSecretsClient
-            user_secrets = UserSecretsClient()
-            os.environ["DATABRICKS_HOST"] = user_secrets.get_secret("DATABRICKS_HOST")
-            os.environ["DATABRICKS_TOKEN"] = user_secrets.get_secret("DATABRICKS_TOKEN")
-            os.environ["MLFLOW_TRACKING_URI"] = "databricks"
-            print("   Success: Retrieved secrets via kaggle_secrets.")
-        except Exception as e:
-            print(f"   Warning: Could not set secrets via Kaggle. Error: {e}")
-            print("   Ensure 'DATABRICKS_HOST' and 'DATABRICKS_TOKEN' are in Add-ons -> Secrets.")
-
-    # 2. Google Colab Detection
-    elif "COLAB_RELEASE_TAG" in os.environ or "google.colab" in sys.modules:
-        print(">> Detected Google Colab Environment")
-        try:
-            from google.colab import userdata
-            os.environ["DATABRICKS_HOST"] = userdata.get("DATABRICKS_HOST")
-            os.environ["DATABRICKS_TOKEN"] = userdata.get("DATABRICKS_TOKEN")
-            os.environ["MLFLOW_TRACKING_URI"] = "databricks"
-            print("   Success: Retrieved secrets via google.colab.userdata.")
-        except Exception as e:
-            print(f"   Warning: Could not set secrets via Colab. Error: {e}")
-            print("   Ensure 'DATABRICKS_HOST' and 'DATABRICKS_TOKEN' are in the Secrets tab (key icon).")
-            
-    # 3. Local/Other
-    else:
-        print(">> Detected Local/Generic Environment")
-        if "DATABRICKS_TOKEN" not in os.environ:
-            print("   Warning: DATABRICKS_TOKEN not found in env vars. MLflow might fail to log to remote.")
 
 # Setup device according to local hardware
 if torch.cuda.is_available():
@@ -122,9 +79,9 @@ class TrainingConfig:
     # Early stopping
     patience: int = 20              # Early stopping patience
     
-    # Dataset
-    dataset_name: str = "frgfm/imagenette"
-    dataset_config_name: str = "160px"
+    # Paths
+    archive_path: str = "/kaggle/input/imagenette-160-px/imagenette-160.tgz"
+    data_dir: str = "/kaggle/working/imagenette-160"
     
     # MLflow
     mlflow_experiment: str = "LejEPA_Experiment" # Name of the experiment in Databricks/MLflow
@@ -220,13 +177,11 @@ class InferenceModel(nn.Module):
 
 class _DatasetSplit(torch.utils.data.Dataset):
     """Internal dataset class used by DatasetManager."""
-    def __init__(self, dataset_name, config_name, split, V=1, img_size=128, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
+    def __init__(self, data_dir, split, V=1, img_size=128, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
         self.V = V
         self.img_size = img_size
-        
-        # Load directly from Hugging Face
-        # trust_remote_code=True is often required for community datasets like this
-        self.ds = load_dataset(dataset_name, config_name, split=split, trust_remote_code=True)
+        # Load using imagefolder (automatically maps 'train'/'validation' folders)
+        self.ds = load_dataset("imagefolder", data_dir=data_dir, split=split)
         
         self.aug = v2.Compose([
             v2.RandomResizedCrop(img_size, scale=(0.08, 1.0)),
@@ -265,15 +220,35 @@ class _DatasetSplit(torch.utils.data.Dataset):
 
 
 class DatasetManager:
-    """Manager class responsible for loading dataset splits."""
-    def __init__(self, dataset_name, dataset_config_name):
-        self.dataset_name = dataset_name
-        self.dataset_config_name = dataset_config_name
+    """Manager class responsible for extraction and spawning dataset splits."""
+    def __init__(self, archive_path, data_dir):
+        self.data_dir = data_dir
+        
+        # Extraction logic
+        if not os.path.exists(self.data_dir):
+            if os.path.exists(archive_path):
+                print(f"Extracting {archive_path} to {os.path.dirname(self.data_dir)}...")
+                with tarfile.open(archive_path, "r:gz") as tar:
+                    tar.extractall(path=os.path.dirname(self.data_dir))
+                print("Extraction complete.")
+            else:
+                print(f"Warning: Archive not found at {archive_path}. Attempting to load from {self.data_dir} anyway.")
+        else:
+            print(f"Data already found at {self.data_dir}")
 
     def get_ds(self, split, V, img_size=128, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
         """Factory method to return the actual Dataset object."""
-        return _DatasetSplit(self.dataset_name, self.dataset_config_name, split, V, img_size, mean, std)
+        return _DatasetSplit(self.data_dir, split, V, img_size, mean, std)
 
+    def cleanup(self):
+        """Remove the extracted dataset directory."""
+        if os.path.exists(self.data_dir):
+            print(f"Cleaning up dataset directory: {self.data_dir}...")
+            try:
+                shutil.rmtree(self.data_dir)
+                print("Cleanup complete.")
+            except Exception as e:
+                print(f"Error during cleanup: {e}")
 
 
 class MetricsLogger:
@@ -330,16 +305,13 @@ def validate(net, probe, test_dl, device, use_amp, amp_dtype):
 
 def main(config: TrainingConfig):
     """Main training function."""
-    # Setup environment secrets (Kaggle/Colab)
-    setup_environment()
-    
     # Print configuration
     config.print_config()
     
     torch.manual_seed(0)
 
     # Initialize Dataset Manager
-    dataset_manager = DatasetManager(config.dataset_name, config.dataset_config_name)
+    dataset_manager = DatasetManager(config.archive_path, config.data_dir)
 
     # Get PyTorch Datasets
     # Note: We access the underlying HF dataset object for MLflow logging using .ds
@@ -439,7 +411,7 @@ def main(config: TrainingConfig):
             # Create MLflow dataset from the underlying Hugging Face dataset
             train_set_mlflow = mlflow.data.from_huggingface(
                 train_ds.ds, 
-                path=config.dataset_name, 
+                path=config.archive_path, 
                 name="imagenette_train"
             )
             mlflow.log_input(train_set_mlflow, context="training")
@@ -646,11 +618,21 @@ def main(config: TrainingConfig):
         print(f"Final Validation Accuracy: {acc:.4f}")
         print(f"{'='*60}\n")
     
+    # ---------------- Cleanup ----------------
+    # Remove the extracted dataset directory to keep Kaggle output clean
+    dataset_manager.cleanup()
+
 
 if __name__ == "__main__":
     # Create configuration with custom parameters
     config = TrainingConfig(
-        epochs=20,
+        lamb=0.02,
+        V=4,
+        proj_dim=16,
+        lr=2e-3,
+        bs=16,
+        accum_steps=16,
+        epochs=2,
         mlflow_experiment="LejEPA_Experiment" # Databricks Experiment Name
     )
     
