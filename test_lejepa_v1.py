@@ -16,7 +16,7 @@ from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torchvision.ops import MLP
 import mlflow
-import mlflow.data # Explicit import for clarity, though accessible via mlflow
+import mlflow.data 
 import numpy as np
 
 # Global variable for Experiment Name (retrieved from secrets)
@@ -341,33 +341,54 @@ class DatasetManager:
 
 
 class MetricsLogger:
-    """Simple metrics logger for tracking training progress."""
+    """
+    Unified metrics logger for tracking training progress locally and via MLflow.
+    Dynamic: stores any metric key passed to it during epoch logging.
+    """
     def __init__(self):
-        self.metrics = {
-            'epoch': [],
-            'train_loss': [],
-            'train_lejepa_loss': [],
-            'train_probe_loss': [],
-            'val_acc': [],
-            'lr': []
-        }
+        # History for epoch-level metrics (saved in checkpoint)
+        # Key -> List of values (e.g., 'val_acc': [0.1, 0.2, ...])
+        self.metrics = {}
     
-    def log(self, **kwargs):
-        for key, value in kwargs.items():
-            if key in self.metrics:
+    def log(self, metrics: dict, step: int, epoch: Optional[int] = None):
+        """
+        Log metrics to MLflow. If 'epoch' is provided, also update local history and print summary.
+        
+        Args:
+            metrics: Dictionary of metric names and values.
+            step: Global step for MLflow logging.
+            epoch: If provided, treat as epoch-end summary (update history & print).
+        """
+        # 1. Log to MLflow
+        try:
+            mlflow.log_metrics(metrics, step=step)
+        except Exception:
+            pass # Fail silently if MLflow not active or configured
+
+        # 2. Handle Epoch End logic (History + Print)
+        if epoch is not None:
+            # Update local history
+            for key, value in metrics.items():
+                if key not in self.metrics:
+                    self.metrics[key] = []
                 self.metrics[key].append(value)
+            
+            # Print summary
+            self.print_summary(epoch, metrics)
     
-    def print_summary(self, epoch):
+    def print_summary(self, epoch, metrics):
         print(f"\n{'='*60}")
         print(f"Epoch {epoch} Summary:")
-        if self.metrics['train_loss']:
-            print(f"  Train Loss: {self.metrics['train_loss'][-1]:.4f}")
-            print(f"  LejEPA Loss: {self.metrics['train_lejepa_loss'][-1]:.4f}")
-            print(f"  Probe Loss: {self.metrics['train_probe_loss'][-1]:.4f}")
-        if self.metrics['val_acc']:
-            print(f"  Val Accuracy: {self.metrics['val_acc'][-1]:.4f}")
-        if self.metrics['lr']:
-            print(f"  Learning Rate: {self.metrics['lr'][-1]:.6f}")
+        # Sort keys for readability
+        for key in sorted(metrics.keys()):
+            # Skip 'epoch' key in list as it's in the header
+            if key == 'epoch': 
+                continue
+            value = metrics[key]
+            if isinstance(value, (float, np.floating)):
+                print(f"  {key}: {value:.4f}")
+            else:
+                print(f"  {key}: {value}")
         print(f"{'='*60}\n")
 
 
@@ -584,8 +605,8 @@ def main(config: TrainingConfig):
                         'grad': f'{grad_norm:.2f}'
                     })
                     
-                    # ---- Log Step Metrics to MLflow ----
-                    mlflow.log_metrics({
+                    # ---- Log Step Metrics via Logger ----
+                    step_metrics = {
                         'train_batch_loss': loss.item() * config.accum_steps,
                         'train_lejepa_loss': lejepa_loss.item(),
                         'train_probe_loss': probe_loss.item(),
@@ -597,8 +618,8 @@ def main(config: TrainingConfig):
                         'epoch': epoch,
                         'batch_idx', batch_idx+1,
                         'train_epoch_loss', avg_loss,
-                    }, step=global_step)
-                    
+                    }
+                    logger.log(step_metrics, step=global_step)
                     global_step += 1
 
             # Calculate epoch averages
@@ -611,23 +632,18 @@ def main(config: TrainingConfig):
             print(f"\nRunning validation...")
             acc = validate(net, probe, test_dl, device, use_amp, amp_dtype)
             
-            # Log metrics (Local Logger)
-            logger.log(
-                epoch=epoch+1,
-                train_loss=avg_loss,
-                train_lejepa_loss=avg_lejepa,
-                train_probe_loss=avg_probe,
-                val_acc=acc,
-                lr=current_lr
-            )
-            logger.print_summary(epoch+1)
-            
-            # ---- Log Epoch Metrics to MLflow ----
-            mlflow.log_metrics({
-                'train_epoch_loss_2': avg_loss,
+            # ---- Log Epoch Metrics via Logger ----
+            epoch_metrics = {
+                'epoch': epoch+1,
+                'train_loss': avg_loss,
+                'train_lejepa_loss': avg_lejepa,
+                'train_probe_loss': avg_probe,
                 'val_acc': acc,
-                'global_step_2', global_step,
-            }, step=(epoch+1)*len(train_dl))
+                'lr': current_lr,
+                # Explicit key for MLflow consistency if needed, but logger maps all keys
+                'train_epoch_loss': avg_loss
+            }
+            logger.log(epoch_metrics, step=global_step, epoch=epoch+1)
 
             # Save best model
             if acc > best_acc:
