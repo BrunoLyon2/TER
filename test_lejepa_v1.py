@@ -18,8 +18,10 @@ import mlflow
 import mlflow.data # Explicit import for clarity, though accessible via mlflow
 import numpy as np
 
-# Initialize DATABRICKS_MLEXPE globally to avoid NameError if not set by setup_environment
+# Initialize globals to avoid NameError if not set by setup_environment
 DATABRICKS_MLEXPE = ""
+ARCHIVE_PATH = ""
+DATA_DIR = ""
 
 # -----------------------------------------------------------------------------
 # Platform Detection & Secret Management
@@ -27,14 +29,18 @@ DATABRICKS_MLEXPE = ""
 def setup_environment():
     """
     Detects if running on Kaggle or Colab and sets up Databricks credentials
-    from their respective Secret managers.
+    from their respective Secret managers. Also sets paths.
     """
-    global DATABRICKS_MLEXPE
+    global DATABRICKS_MLEXPE, ARCHIVE_PATH, DATA_DIR
     print("Detecting environment...")
     
     # 1. Kaggle Detection
     if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:
         print(">> Detected Kaggle Environment")
+        # Kaggle specific paths
+        ARCHIVE_PATH = "/kaggle/input/imagenette-160-px/imagenette-160.tgz"
+        DATA_DIR = "/kaggle/working/imagenette-160"
+        
         try:
             from kaggle_secrets import UserSecretsClient
             user_secrets = UserSecretsClient()
@@ -55,6 +61,10 @@ def setup_environment():
     # 2. Google Colab Detection
     elif "COLAB_RELEASE_TAG" in os.environ or "google.colab" in sys.modules:
         print(">> Detected Google Colab Environment")
+        # Colab specific paths
+        ARCHIVE_PATH = "/content/imagenette2-160.tgz"
+        DATA_DIR = "/content/imagenette2-160"
+        
         try:
             from google.colab import userdata
             os.environ["DATABRICKS_HOST"] = userdata.get("DATABRICKS_HOST")
@@ -72,6 +82,10 @@ def setup_environment():
     # 3. Local/Other
     else:
         print(">> Detected Local/Generic Environment")
+        # Fallback local paths
+        ARCHIVE_PATH = "imagenette-160.tgz"
+        DATA_DIR = "./imagenette-160"
+        
         if "DATABRICKS_TOKEN" not in os.environ:
             print("   Warning: DATABRICKS_TOKEN not found in env vars. MLflow might fail to log to remote.")
 
@@ -141,8 +155,8 @@ class TrainingConfig:
     patience: int = 20              # Early stopping patience
     
     # Paths
-    archive_path: str = '/content/imagenette2-160.tgz'
-    data_dir: str = '/content/imagenette2-160'
+    archive_path: str = '' # Set in __main__
+    data_dir: str = ''     # Set in __main__
     
     # MLflow
     mlflow_experiment: str = "" # Name of the experiment in Databricks/MLflow
@@ -689,8 +703,8 @@ if __name__ == "__main__":
     config = TrainingConfig(
         epochs=2,
         mlflow_experiment=DATABRICKS_MLEXPE, # Databricks Experiment Name
-        archive_path="/kaggle/input/imagenette-160-px/imagenette-160.tgz",
-        data_dir="/kaggle/working/imagenette-160"
+        archive_path=ARCHIVE_PATH,
+        data_dir=DATA_DIR
     )
     
     # You can also override specific parameters like this:
