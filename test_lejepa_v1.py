@@ -481,6 +481,7 @@ def main(config: TrainingConfig):
     print(f"Total optimization steps: {total_steps}\n")
     
     best_acc = 0.0
+    acc = 0.0
     patience = 0
     global_step = 0
     
@@ -588,7 +589,8 @@ def main(config: TrainingConfig):
                         'train_lejepa_loss': lejepa_loss.item(),
                         'train_probe_loss': probe_loss.item(),
                         'lr': current_lr,
-                        'grad_norm': grad_norm.item()
+                        'grad_norm': grad_norm.item(),
+                        'val_acc0': acc,
                     }, step=global_step)
                     
                     global_step += 1
@@ -618,7 +620,7 @@ def main(config: TrainingConfig):
             mlflow.log_metrics({
                 'train_epoch_loss': avg_loss,
                 'val_acc': acc
-            }, step=global_step)
+            }, step=(epochs+1)*len(train_dl))
 
             # Save best model
             if acc > best_acc:
@@ -671,6 +673,7 @@ def main(config: TrainingConfig):
             else:
                 patience += 1
                 print(f"No improvement. Patience: {patience}/{config.patience}")
+                print(f"Accuracy: {acc:.4f}. Same as previous...")
             
             # Early stopping
             if patience >= config.patience:
@@ -716,6 +719,7 @@ if __name__ == "__main__":
     # Create configuration with custom parameters
     config = TrainingConfig(
         epochs=2,
+        patience=2,
         mlflow_experiment=DATABRICKS_MLEXPE, # Databricks Experiment Name
         platform=CURRENT_PLATFORM
     )
