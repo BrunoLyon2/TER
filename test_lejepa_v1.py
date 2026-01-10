@@ -592,6 +592,7 @@ def main(config: TrainingConfig):
                         'grad_norm': grad_norm.item(),
                         'step': global_step,
                         'val_acc0': acc,
+                        'global_step': global_step,
                     }, step=global_step)
                     
                     global_step += 1
@@ -622,7 +623,7 @@ def main(config: TrainingConfig):
                 'train_epoch_loss': avg_loss,
                 'val_acc': acc,
                 'global_step_2', global_step,
-            }, step=(epochs+1)*len(train_dl))
+            }, step=(epoch+1)*len(train_dl))
 
             # Save best model
             if acc > best_acc:
