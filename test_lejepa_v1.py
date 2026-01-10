@@ -590,6 +590,7 @@ def main(config: TrainingConfig):
                         'train_probe_loss': probe_loss.item(),
                         'lr': current_lr,
                         'grad_norm': grad_norm.item(),
+                        'step': global_step,
                         'val_acc0': acc,
                     }, step=global_step)
                     
@@ -619,7 +620,8 @@ def main(config: TrainingConfig):
             # ---- Log Epoch Metrics to MLflow ----
             mlflow.log_metrics({
                 'train_epoch_loss': avg_loss,
-                'val_acc': acc
+                'val_acc': acc,
+                'global_step_2', global_step,
             }, step=(epochs+1)*len(train_dl))
 
             # Save best model
