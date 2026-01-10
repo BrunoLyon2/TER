@@ -482,6 +482,7 @@ def main(config: TrainingConfig):
     
     best_acc = 0.0
     acc = 0.0
+    avg_loss = 0.0
     patience = 0
     global_step = 0
     
@@ -593,6 +594,9 @@ def main(config: TrainingConfig):
                         'step': global_step,
                         'val_acc0': acc,
                         'global_step': global_step,
+                        'epoch': epoch,
+                        'batch_idx', batch_idx+1,
+                        'train_epoch_loss', avg_loss,
                     }, step=global_step)
                     
                     global_step += 1
@@ -620,7 +624,7 @@ def main(config: TrainingConfig):
             
             # ---- Log Epoch Metrics to MLflow ----
             mlflow.log_metrics({
-                'train_epoch_loss': avg_loss,
+                'train_epoch_loss_2': avg_loss,
                 'val_acc': acc,
                 'global_step_2', global_step,
             }, step=(epoch+1)*len(train_dl))
