@@ -1,4 +1,3 @@
-
 import os
 import sys
 import shutil
@@ -41,7 +40,6 @@ def setup_environment():
             user_secrets = UserSecretsClient()
             os.environ["DATABRICKS_HOST"] = user_secrets.get_secret("DATABRICKS_HOST")
             os.environ["DATABRICKS_TOKEN"] = user_secrets.get_secret("DATABRICKS_TOKEN")
-            global DATABRICKS_MLEXPE # Declare global to assign
             # Assuming DATABRICKS_MLEXPE might be a secret on Kaggle too
             DATABRICKS_MLEXPE = user_secrets.get_secret("DATABRICKS_MLEXPE", default="")
             os.environ["MLFLOW_TRACKING_URI"] = "databricks"
@@ -57,7 +55,6 @@ def setup_environment():
             from google.colab import userdata
             os.environ["DATABRICKS_HOST"] = userdata.get("DATABRICKS_HOST")
             os.environ["DATABRICKS_TOKEN"] = userdata.get("DATABRICKS_TOKEN")
-            global DATABRICKS_MLEXPE # Declare global to assign
             DATABRICKS_MLEXPE = userdata.get("DATABRICKS_MLEXPE") # Assign value to the global variable
             os.environ["MLFLOW_TRACKING_URI"] = "databricks"
             print("   Success: Retrieved secrets via google.colab.userdata.")
@@ -137,11 +134,11 @@ class TrainingConfig:
 
     # Early stopping
     patience: int = 20              # Early stopping patience
-    
+
     # Paths
-    archive_path: str = "/kaggle/input/imagenette-160-px/imagenette-160.tgz"
-    data_dir: str = "/kaggle/working/imagenette-160"
-    
+    archive_path: str = '/content/imagenette2-160.tgz'#"/kaggle/input/imagenette-160-px/imagenette-160.tgz"
+    data_dir: str = '/content/imagenette2-160' #"/kaggle/working/imagenette-160"
+
     # MLflow
     mlflow_experiment: str = "" # Name of the experiment in Databricks/MLflow
 
@@ -241,7 +238,7 @@ class _DatasetSplit(torch.utils.data.Dataset):
         self.img_size = img_size
         # Load using imagefolder (automatically maps 'train'/'validation' folders)
         self.ds = load_dataset("imagefolder", data_dir=data_dir, split=split)
-        
+
         self.aug = v2.Compose([
             v2.RandomResizedCrop(img_size, scale=(0.08, 1.0)),
             v2.RandomApply([v2.ColorJitter(0.8, 0.8, 0.8, 0.2)], p=0.8),
@@ -282,7 +279,7 @@ class DatasetManager:
     """Manager class responsible for extraction and spawning dataset splits."""
     def __init__(self, archive_path, data_dir):
         self.data_dir = data_dir
-        
+
         # Extraction logic
         if not os.path.exists(self.data_dir):
             if os.path.exists(archive_path):
@@ -473,8 +470,8 @@ def main(config: TrainingConfig):
         try:
             # Create MLflow dataset from the underlying Hugging Face dataset
             train_set_mlflow = mlflow.data.from_huggingface(
-                train_ds.ds, 
-                path=config.archive_path, 
+                train_ds.ds,
+                path=config.archive_path,
                 name="imagenette_train"
             )
             mlflow.log_input(train_set_mlflow, context="training")
@@ -680,7 +677,7 @@ def main(config: TrainingConfig):
         print(f"Best Validation Accuracy: {best_acc:.4f}")
         print(f"Final Validation Accuracy: {acc:.4f}")
         print(f"{'='*60}\n")
-    
+
     # ---------------- Cleanup ----------------
     # Remove the extracted dataset directory to keep Kaggle output clean
     dataset_manager.cleanup()
