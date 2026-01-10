@@ -467,7 +467,7 @@ def main(config: TrainingConfig):
     total_steps = steps_per_epoch * config.epochs
 
     s1 = LinearLR(opt, start_factor=0.01, total_iters=warmup_steps)
-    s2 = CosineAnnealingLR(opt, T_max=total_steps - warmup_steps, eta_min=config.min_lr)
+    s2 = CosineAnnealingLR(opt, T_max=max(1, total_steps - warmup_steps), eta_min=config.min_lr)
     scheduler = SequentialLR(opt, schedulers=[s1, s2], milestones=[warmup_steps])
 
     scaler = GradScaler(enabled=use_amp)
