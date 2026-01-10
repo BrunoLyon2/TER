@@ -701,7 +701,7 @@ def main(config: TrainingConfig):
 if __name__ == "__main__":
     # Create configuration with custom parameters
     config = TrainingConfig(
-        epochs=2,
+        epochs=1,
         mlflow_experiment=DATABRICKS_MLEXPE, # Databricks Experiment Name
         archive_path=ARCHIVE_PATH,
         data_dir=DATA_DIR
