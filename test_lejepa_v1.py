@@ -688,6 +688,8 @@ if __name__ == "__main__":
     config = TrainingConfig(
         epochs=2,
         mlflow_experiment=DATABRICKS_MLEXPE # Databricks Experiment Name
+        archive_path: str = "/kaggle/input/imagenette-160-px/imagenette-160.tgz"#'/content/imagenette2-160.tgz'#"/kaggle/input/imagenette-160-px/imagenette-160.tgz"
+        data_dir: str = "/kaggle/working/imagenette-160"#'/content/imagenette2-160' #"/kaggle/working/imagenette-160"
     )
 
     # You can also override specific parameters like this:
