@@ -1,7 +1,9 @@
 import os
+import sys
 import shutil
 import tarfile
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +16,77 @@ from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torchvision.ops import MLP
 import mlflow
+import mlflow.data # Explicit import for clarity, though accessible via mlflow
+import numpy as np
+
+# Global variable for Experiment Name (retrieved from secrets)
+DATABRICKS_MLEXPE = ""
+
+# -----------------------------------------------------------------------------
+# Platform Detection & Secret Management
+# -----------------------------------------------------------------------------
+def setup_environment() -> str:
+    """
+    Detects if running on Kaggle or Colab and sets up Databricks credentials
+    from their respective Secret managers.
+    
+    Returns:
+        str: The detected platform ('kaggle', 'colab', or 'local').
+    """
+    global DATABRICKS_MLEXPE
+    print("Detecting environment...")
+    platform = "local"
+    
+    # 1. Kaggle Detection
+    if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:
+        print(">> Detected Kaggle Environment")
+        platform = "kaggle"
+        try:
+            from kaggle_secrets import UserSecretsClient
+            user_secrets = UserSecretsClient()
+            os.environ["DATABRICKS_HOST"] = user_secrets.get_secret("DATABRICKS_HOST")
+            os.environ["DATABRICKS_TOKEN"] = user_secrets.get_secret("DATABRICKS_TOKEN")
+            # Retrieve experiment name secret
+            try:
+                DATABRICKS_MLEXPE = user_secrets.get_secret("DATABRICKS_MLEXPE")
+            except:
+                DATABRICKS_MLEXPE = ""
+                
+            os.environ["MLFLOW_TRACKING_URI"] = "databricks"
+            print("   Success: Retrieved secrets via kaggle_secrets.")
+        except Exception as e:
+            print(f"   Warning: Could not set secrets via Kaggle. Error: {e}")
+            print("   Ensure 'DATABRICKS_HOST' and 'DATABRICKS_TOKEN' are in Add-ons -> Secrets.")
+
+    # 2. Google Colab Detection
+    elif "COLAB_RELEASE_TAG" in os.environ or "google.colab" in sys.modules:
+        print(">> Detected Google Colab Environment")
+        platform = "colab"
+        try:
+            from google.colab import userdata
+            os.environ["DATABRICKS_HOST"] = userdata.get("DATABRICKS_HOST")
+            os.environ["DATABRICKS_TOKEN"] = userdata.get("DATABRICKS_TOKEN")
+            try:
+                DATABRICKS_MLEXPE = userdata.get("DATABRICKS_MLEXPE")
+            except:
+                DATABRICKS_MLEXPE = ""
+            os.environ["MLFLOW_TRACKING_URI"] = "databricks"
+            print("   Success: Retrieved secrets via google.colab.userdata.")
+        except Exception as e:
+            print(f"   Warning: Could not set secrets via Colab. Error: {e}")
+            print("   Ensure 'DATABRICKS_HOST' and 'DATABRICKS_TOKEN' are in the Secrets tab (key icon).")
+            
+    # 3. Local/Other
+    else:
+        print(">> Detected Local/Generic Environment")
+        platform = "local"
+        if "DATABRICKS_TOKEN" not in os.environ:
+            print("   Warning: DATABRICKS_TOKEN not found in env vars. MLflow might fail to log to remote.")
+            
+    return platform
+
+# Call setup_environment here to get platform and set secrets
+CURRENT_PLATFORM = setup_environment()
 
 # Setup device according to local hardware
 if torch.cuda.is_available():
@@ -77,15 +150,33 @@ class TrainingConfig:
     # Early stopping
     patience: int = 20              # Early stopping patience
     
-    # Paths
-    archive_path: str = "/kaggle/input/imagenette-160-px/imagenette-160.tgz"
-    data_dir: str = "/kaggle/working/imagenette-160"
+    # Environment & Paths
+    platform: str = "local"         # 'kaggle', 'colab', or 'local'
+    archive_path: Optional[str] = None
+    data_dir: Optional[str] = None
     
     # MLflow
-    mlflow_experiment: str = "LejEPA_Experiment" # Name of the experiment in Databricks/MLflow
+    mlflow_experiment: str = "" # Name of the experiment in Databricks/MLflow
     
     def __post_init__(self):
-        """Validate configuration."""
+        """Validate configuration and set platform-specific paths."""
+        # 1. Set default paths based on platform if not provided
+        if self.archive_path is None:
+            if self.platform == "kaggle":
+                self.archive_path = "/kaggle/input/imagenette-160-px/imagenette-160.tgz"
+                self.data_dir = "/kaggle/working/imagenette-160"
+            elif self.platform == "colab":
+                self.archive_path = "/content/imagenette2-160.tgz"
+                self.data_dir = "/content/imagenette2-160"
+            else: # local
+                self.archive_path = "imagenette-160.tgz"
+                self.data_dir = "./imagenette-160"
+        
+        # Ensure data_dir is set if archive_path was manual but data_dir wasn't
+        if self.data_dir is None:
+            self.data_dir = "./imagenette-160"
+
+        # 2. Validation
         assert self.bs > 0, "Batch size must be positive"
         assert self.V >= 1, "Number of views must be at least 1"
         assert self.accum_steps > 0, "Accumulation steps must be positive"
@@ -151,6 +242,26 @@ class ViTEncoder(nn.Module):
         N, V = x.shape[:2]
         emb = self.backbone(x.flatten(0, 1))
         return emb, self.proj(emb).reshape(N, V, -1).transpose(0, 1)
+
+
+class InferenceModel(nn.Module):
+    """
+    Wrapper model for deployment/inference.
+    Accepts standard 4D image batch [B, C, H, W] and returns class logits.
+    """
+    def __init__(self, net, probe):
+        super().__init__()
+        self.net = net
+        self.probe = probe
+        
+    def forward(self, x):
+        # ViTEncoder expects 5D input [B, Views, C, H, W].
+        # For standard inference, we assume 1 View.
+        if x.ndim == 4:
+            x = x.unsqueeze(1)
+            
+        emb, _ = self.net(x)
+        return self.probe(emb)
 
 
 class _DatasetSplit(torch.utils.data.Dataset):
@@ -292,6 +403,7 @@ def main(config: TrainingConfig):
     dataset_manager = DatasetManager(config.archive_path, config.data_dir)
 
     # Get PyTorch Datasets
+    # Note: We access the underlying HF dataset object for MLflow logging using .ds
     train_ds = dataset_manager.get_ds(split="train", V=config.V, img_size=config.img_size)
     test_ds = dataset_manager.get_ds(split="validation", V=1, img_size=config.img_size)
     
@@ -355,7 +467,7 @@ def main(config: TrainingConfig):
     total_steps = steps_per_epoch * config.epochs
 
     s1 = LinearLR(opt, start_factor=0.01, total_iters=warmup_steps)
-    s2 = CosineAnnealingLR(opt, T_max=total_steps - warmup_steps, eta_min=config.min_lr)
+    s2 = CosineAnnealingLR(opt, T_max=max(1, total_steps - warmup_steps), eta_min=config.min_lr)
     scheduler = SequentialLR(opt, schedulers=[s1, s2], milestones=[warmup_steps])
 
     scaler = GradScaler(enabled=use_amp)
@@ -383,6 +495,29 @@ def main(config: TrainingConfig):
         # Log all configuration parameters
         mlflow.log_params(asdict(config))
         
+        # --- Log Data Lineage ---
+        try:
+            # Create MLflow dataset from the underlying Hugging Face dataset
+            train_set_mlflow = mlflow.data.from_huggingface(
+                train_ds.ds, 
+                path=config.archive_path, 
+                name="imagenette_train"
+            )
+            mlflow.log_input(train_set_mlflow, context="training")
+            print("Logged training dataset info (lineage) to MLflow.")
+        except Exception as e:
+            print(f"Warning: Failed to log dataset info: {e}")
+
+        # --- Pre-generate example input for MLflow Signature ---
+        try:
+            example_input_tensor = torch.randn(1, 3, config.img_size, config.img_size, device=device)
+            example_input = example_input_tensor.detach().cpu().numpy()
+            print("Generated example input for MLflow signature.")
+        except Exception as e:
+            print(f"Warning: Failed to generate example input: {e}")
+            example_input = None
+            example_input_tensor = None
+
         # Training loop
         for epoch in range(config.epochs):
             net.train()
@@ -490,6 +625,8 @@ def main(config: TrainingConfig):
                 best_acc = acc
                 patience = 0
                 print(f"✓ New best accuracy: {best_acc:.4f}. Saving best model...")
+                
+                # 1. Save resumable checkpoint (Dictionary)
                 checkpoint = {
                     'net_state_dict': net.state_dict() if not hasattr(net, '_orig_mod') else net._orig_mod.state_dict(),
                     'probe_state_dict': probe.state_dict() if not hasattr(probe, '_orig_mod') else probe._orig_mod.state_dict(),
@@ -501,10 +638,35 @@ def main(config: TrainingConfig):
                     'best_accuracy': best_acc,
                     'metrics': logger.metrics
                 }
-                torch.save(checkpoint, "best_model.pth")
+                #torch.save(checkpoint, "best_model.pth")
+                #mlflow.log_artifact("best_model.pth")
                 
-                # ---- Log Artifact to MLflow ----
-                mlflow.log_artifact("best_model.pth")
+                # 2. Log deployment-ready model with signature
+                if example_input_tensor is not None:
+                    try:
+                        # Wrap modules
+                        inference_model = InferenceModel(
+                            net._orig_mod if hasattr(net, '_orig_mod') else net,
+                            probe._orig_mod if hasattr(probe, '_orig_mod') else probe
+                        )
+                        inference_model.eval()
+                        
+                        # Generate output for signature using current best model
+                        with torch.no_grad():
+                            # InferenceModel handles the 4D -> 5D conversion
+                            example_output = inference_model(example_input_tensor).detach().cpu().numpy()
+                        
+                        signature = mlflow.models.infer_signature(example_input, example_output)
+                        
+                        mlflow.pytorch.log_model(
+                            inference_model,
+                            "deployment_model",
+                            signature=signature,
+                            input_example=example_input
+                        )
+                        print("Logged deployment_model with signature to MLflow.")
+                    except Exception as e:
+                        print(f"Warning: Failed to log model with signature: {e}")
                 
             else:
                 patience += 1
@@ -534,10 +696,10 @@ def main(config: TrainingConfig):
             'best_accuracy': best_acc,
             'metrics': logger.metrics
         }
-        torch.save(final_checkpoint, final_filename)
+        #torch.save(final_checkpoint, final_filename)
         
         # ---- Log Final Artifact to MLflow ----
-        mlflow.log_artifact(final_filename)
+        #mlflow.log_artifact(final_filename)
         
         print(f"\n{'='*60}")
         print("Training Complete!")
@@ -554,7 +716,8 @@ if __name__ == "__main__":
     # Create configuration with custom parameters
     config = TrainingConfig(
         epochs=2,
-        mlflow_experiment="My_Lejepa_v1" # Databricks Experiment Name
+        mlflow_experiment=DATABRICKS_MLEXPE, # Databricks Experiment Name
+        platform=CURRENT_PLATFORM
     )
     
     # You can also override specific parameters like this:
