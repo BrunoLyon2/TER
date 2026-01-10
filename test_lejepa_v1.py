@@ -2,7 +2,8 @@ import os
 import sys
 import shutil
 import tarfile
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,35 +19,34 @@ import mlflow
 import mlflow.data # Explicit import for clarity, though accessible via mlflow
 import numpy as np
 
-# Initialize globals to avoid NameError if not set by setup_environment
+# Global variable for Experiment Name (retrieved from secrets)
 DATABRICKS_MLEXPE = ""
-ARCHIVE_PATH = ""
-DATA_DIR = ""
 
 # -----------------------------------------------------------------------------
 # Platform Detection & Secret Management
 # -----------------------------------------------------------------------------
-def setup_environment():
+def setup_environment() -> str:
     """
     Detects if running on Kaggle or Colab and sets up Databricks credentials
-    from their respective Secret managers. Also sets paths.
+    from their respective Secret managers.
+    
+    Returns:
+        str: The detected platform ('kaggle', 'colab', or 'local').
     """
-    global DATABRICKS_MLEXPE, ARCHIVE_PATH, DATA_DIR
+    global DATABRICKS_MLEXPE
     print("Detecting environment...")
+    platform = "local"
     
     # 1. Kaggle Detection
     if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:
         print(">> Detected Kaggle Environment")
-        # Kaggle specific paths
-        ARCHIVE_PATH = "/kaggle/input/imagenette-160-px/imagenette-160.tgz"
-        DATA_DIR = "/kaggle/working/imagenette-160"
-        
+        platform = "kaggle"
         try:
             from kaggle_secrets import UserSecretsClient
             user_secrets = UserSecretsClient()
             os.environ["DATABRICKS_HOST"] = user_secrets.get_secret("DATABRICKS_HOST")
             os.environ["DATABRICKS_TOKEN"] = user_secrets.get_secret("DATABRICKS_TOKEN")
-            # Retrieve experiment name secret, default to empty string if missing
+            # Retrieve experiment name secret
             try:
                 DATABRICKS_MLEXPE = user_secrets.get_secret("DATABRICKS_MLEXPE")
             except:
@@ -61,10 +61,7 @@ def setup_environment():
     # 2. Google Colab Detection
     elif "COLAB_RELEASE_TAG" in os.environ or "google.colab" in sys.modules:
         print(">> Detected Google Colab Environment")
-        # Colab specific paths
-        ARCHIVE_PATH = "/content/imagenette2-160.tgz"
-        DATA_DIR = "/content/imagenette2-160"
-        
+        platform = "colab"
         try:
             from google.colab import userdata
             os.environ["DATABRICKS_HOST"] = userdata.get("DATABRICKS_HOST")
@@ -82,15 +79,14 @@ def setup_environment():
     # 3. Local/Other
     else:
         print(">> Detected Local/Generic Environment")
-        # Fallback local paths
-        ARCHIVE_PATH = "imagenette-160.tgz"
-        DATA_DIR = "./imagenette-160"
-        
+        platform = "local"
         if "DATABRICKS_TOKEN" not in os.environ:
             print("   Warning: DATABRICKS_TOKEN not found in env vars. MLflow might fail to log to remote.")
+            
+    return platform
 
-# Call setup_environment here, at the global scope
-setup_environment()
+# Call setup_environment here to get platform and set secrets
+CURRENT_PLATFORM = setup_environment()
 
 # Setup device according to local hardware
 if torch.cuda.is_available():
@@ -154,15 +150,33 @@ class TrainingConfig:
     # Early stopping
     patience: int = 20              # Early stopping patience
     
-    # Paths
-    archive_path: str = '' # Set in __main__
-    data_dir: str = ''     # Set in __main__
+    # Environment & Paths
+    platform: str = "local"         # 'kaggle', 'colab', or 'local'
+    archive_path: Optional[str] = None
+    data_dir: Optional[str] = None
     
     # MLflow
     mlflow_experiment: str = "" # Name of the experiment in Databricks/MLflow
     
     def __post_init__(self):
-        """Validate configuration."""
+        """Validate configuration and set platform-specific paths."""
+        # 1. Set default paths based on platform if not provided
+        if self.archive_path is None:
+            if self.platform == "kaggle":
+                self.archive_path = "/kaggle/input/imagenette-160-px/imagenette-160.tgz"
+                self.data_dir = "/kaggle/working/imagenette-160"
+            elif self.platform == "colab":
+                self.archive_path = "/content/imagenette2-160.tgz"
+                self.data_dir = "/content/imagenette2-160"
+            else: # local
+                self.archive_path = "imagenette-160.tgz"
+                self.data_dir = "./imagenette-160"
+        
+        # Ensure data_dir is set if archive_path was manual but data_dir wasn't
+        if self.data_dir is None:
+            self.data_dir = "./imagenette-160"
+
+        # 2. Validation
         assert self.bs > 0, "Batch size must be positive"
         assert self.V >= 1, "Number of views must be at least 1"
         assert self.accum_steps > 0, "Accumulation steps must be positive"
@@ -701,10 +715,9 @@ def main(config: TrainingConfig):
 if __name__ == "__main__":
     # Create configuration with custom parameters
     config = TrainingConfig(
-        epochs=1,
+        epochs=2,
         mlflow_experiment=DATABRICKS_MLEXPE, # Databricks Experiment Name
-        archive_path=ARCHIVE_PATH,
-        data_dir=DATA_DIR
+        platform=CURRENT_PLATFORM
     )
     
     # You can also override specific parameters like this:
