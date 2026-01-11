@@ -681,7 +681,7 @@ def main(config: TrainingConfig):
                         
                         mlflow.pytorch.log_model(
                             inference_model,
-                            "deployment_model",
+                            name="deployment_model",
                             signature=signature,
                             input_example=example_input
                         )
@@ -719,8 +719,6 @@ def main(config: TrainingConfig):
             'metrics': logger.metrics
         }
         #torch.save(final_checkpoint, final_filename)
-        
-        # ---- Log Final Artifact to MLflow ----
         #mlflow.log_artifact(final_filename)
         
         print(f"\n{'='*60}")
