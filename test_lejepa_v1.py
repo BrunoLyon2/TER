@@ -613,8 +613,8 @@ def main(config: TrainingConfig):
                         'val_acc': acc,
                         'global_step': global_step,
                         'epoch': epoch+1,
-                        'batch_idx', batch_idx+1,
-                        'avg_loss', avg_loss,
+                        'batch_idx': batch_idx+1,
+                        'avg_loss': avg_loss,
                     }
                     logger.log(step_metrics, step=global_step)
                     global_step += 1
