@@ -665,7 +665,7 @@ def main(config: TrainingConfig):
                         'best_acc': best_acc,
                     }
                     print(f"Logging step {global_step}")
-                    logger.log(step_metrics, step=global_step, epoch=epoch+1)
+                    logger.log(step_metrics, step=global_step)
                     global_step += 1
 
             # Calculate epoch averages
