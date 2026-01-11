@@ -554,7 +554,7 @@ def main(config: TrainingConfig):
     except Exception as e:
         print(f"Note: Could not explicitly set MLflow experiment (might be running in a notebook with default exp). Error: {e}")
 
-    with mlflow.start_run(run_name=f"run_{CURRENT_PLATFORM}-{now.strftime("%Y-%m-%d_%H-%M")}") as run:
+    with mlflow.start_run(run_name=f"run_{CURRENT_PLATFORM}-{now.strftime('%Y-%m-%d_%H-%M')}") as run:
         # Log all configuration parameters
         mlflow.log_params(asdict(config))
         
@@ -807,8 +807,9 @@ def main(config: TrainingConfig):
 if __name__ == "__main__":
     # Create configuration with custom parameters
     config = TrainingConfig(
-        epochs=2,
-        patience=2,
+        epochs=100,
+        patience=100,
+        num_workers=2,# with T4
         mlflow_experiment=DATABRICKS_MLEXPE, # Databricks Experiment Name
         platform=CURRENT_PLATFORM
     )
