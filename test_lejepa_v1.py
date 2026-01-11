@@ -118,12 +118,13 @@ else:
 
 @dataclass
 class TrainingConfig:
-    """Configuration for training the ViT encoder with LejEPA."""
+    """Configuration for training the encoder with LejEPA."""
     # Model hyperparameters
+    backbone: str = "mobilevitv2_100" # note for imagenette use _050 or _100. Was "vit_small_patch8_224"
     lamb: float = 0.02              # Balance between SigReg and invariance loss
     V: int = 4                      # Number of augmented views per image
     proj_dim: int = 16              # Projection dimension
-    drop_path_rate: float = 0.1     # Stochastic depth rate for ViT backbone
+    drop_path_rate: float = 0.1     # Stochastic depth rate for backbone
     proj_dropout: float = 0.1       # Dropout rate for projection MLP
     probe_dropout: float = 0.1      # Dropout rate for linear probe
     
@@ -230,11 +231,17 @@ class SIGReg(torch.nn.Module):
         return statistic.mean()
 
 
-class ViTEncoder(nn.Module):
-    def __init__(self, proj_dim=128, drop_path_rate=0.1, proj_dropout=0.1, img_size=128):
+class ImageEncoder(nn.Module):
+    """
+    Generic Image Encoder.
+    Replaces ViTEncoder to support arbitrary timm models (like mobilevitv2).
+    """
+    def __init__(self, model_name="mobilevitv2_100", proj_dim=128, drop_path_rate=0.1, proj_dropout=0.1, img_size=128):
         super().__init__()
+        # We set num_classes=512 to ensure the backbone output has dimension 512.
+        # For timm models, this usually adds a final linear layer (or uses the classifier head).
         self.backbone = timm.create_model(
-            "vit_small_patch8_224",
+            model_name,
             pretrained=False,
             num_classes=512,
             drop_path_rate=drop_path_rate,
@@ -244,7 +251,11 @@ class ViTEncoder(nn.Module):
 
     def forward(self, x):
         N, V = x.shape[:2]
+        # Flatten batch and views: [B, V, C, H, W] -> [B*V, C, H, W]
+        # The backbone returns [B*V, 512] because we set num_classes=512
         emb = self.backbone(x.flatten(0, 1))
+        
+        # Reshape back to [B, V, 512] for projection
         return emb, self.proj(emb).reshape(N, V, -1).transpose(0, 1)
 
 
@@ -259,7 +270,7 @@ class InferenceModel(nn.Module):
         self.probe = probe
         
     def forward(self, x):
-        # ViTEncoder expects 5D input [B, Views, C, H, W].
+        # Encoder expects 5D input [B, Views, C, H, W].
         # For standard inference, we assume 1 View.
         if x.ndim == 4:
             x = x.unsqueeze(1)
@@ -488,7 +499,8 @@ def main(config: TrainingConfig):
     )
 
     # Modules and loss
-    net = ViTEncoder(
+    net = ImageEncoder(
+        model_name=config.backbone,
         proj_dim=config.proj_dim, 
         drop_path_rate=config.drop_path_rate,
         proj_dropout=config.proj_dropout,
