@@ -738,7 +738,7 @@ def main(config: TrainingConfig):
                         
                         mlflow.pytorch.log_model(
                             inference_model,
-                            name="deployment_model",
+                            name=f"deployment_model_epoch_{epoch}_acc_{acc:.4f}",
                             signature=signature,
                             input_example=example_input
                         )
