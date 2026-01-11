@@ -3,6 +3,7 @@ import sys
 import shutil
 import tarfile
 import warnings
+from datetime import datetime
 from dataclasses import dataclass, asdict, field
 from typing import Optional
 from urllib.request import urlretrieve
@@ -554,6 +555,7 @@ def main(config: TrainingConfig):
     except Exception as e:
         print(f"Note: Could not explicitly set MLflow experiment (might be running in a notebook with default exp). Error: {e}")
 
+    now = datetime.now()
     with mlflow.start_run(run_name=f"run_{CURRENT_PLATFORM}-{now.strftime('%Y-%m-%d_%H-%M')}") as run:
         # Log all configuration parameters
         mlflow.log_params(asdict(config))
