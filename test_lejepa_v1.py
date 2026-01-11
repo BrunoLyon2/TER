@@ -2,8 +2,10 @@ import os
 import sys
 import shutil
 import tarfile
+import warnings
 from dataclasses import dataclass, asdict, field
 from typing import Optional
+from urllib.request import urlretrieve
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -154,6 +156,7 @@ class TrainingConfig:
     platform: str = "local"         # 'kaggle', 'colab', or 'local'
     archive_path: Optional[str] = None
     data_dir: Optional[str] = None
+    archive_uri: str = "https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-160.tgz"
     
     # MLflow
     mlflow_experiment: str = "" # Name of the experiment in Databricks/MLflow
@@ -169,12 +172,12 @@ class TrainingConfig:
                 self.archive_path = "/content/imagenette2-160.tgz"
                 self.data_dir = "/content/imagenette2-160"
             else: # local
-                self.archive_path = "imagenette-160.tgz"
-                self.data_dir = "./imagenette-160"
+                self.archive_path = "imagenette2-160.tgz"
+                self.data_dir = "./imagenette2-160"
         
         # Ensure data_dir is set if archive_path was manual but data_dir wasn't
         if self.data_dir is None:
-            self.data_dir = "./imagenette-160"
+            self.data_dir = "./imagenette2-160"
 
         # 2. Validation
         assert self.bs > 0, "Batch size must be positive"
@@ -310,18 +313,48 @@ class _DatasetSplit(torch.utils.data.Dataset):
 
 class DatasetManager:
     """Manager class responsible for extraction and spawning dataset splits."""
-    def __init__(self, archive_path, data_dir):
+    def __init__(self, archive_path, data_dir, archive_uri=None):
         self.data_dir = data_dir
+        self.archive_path = archive_path
         
         # Extraction logic
         if not os.path.exists(self.data_dir):
-            if os.path.exists(archive_path):
-                print(f"Extracting {archive_path} to {os.path.dirname(self.data_dir)}...")
-                with tarfile.open(archive_path, "r:gz") as tar:
+            
+            # 1. Download if missing and URI provided
+            if not os.path.exists(self.archive_path):
+                if archive_uri:
+                    print(f"Archive not found at {self.archive_path}. Attempting download...")
+                    
+                    # Ensure we are writing to a writable location
+                    # On Kaggle, /kaggle/input is read-only. We must assume archive_path was meant to be read-only.
+                    # If it's missing there, we must download to a writable spot (like data_dir's parent)
+                    target_dir = os.path.dirname(self.archive_path)
+                    
+                    # Simple check for write access or known read-only paths
+                    is_writable = os.access(target_dir, os.W_OK) if target_dir else True
+                    
+                    if not is_writable or "kaggle/input" in self.archive_path:
+                        print(f"Path {self.archive_path} is likely read-only. redirecting download to {self.data_dir}'s parent.")
+                        target_dir = os.path.dirname(self.data_dir)
+                        self.archive_path = os.path.join(target_dir, os.path.basename(self.archive_path))
+                    
+                    print(f"Downloading from {archive_uri} to {self.archive_path}...")
+                    try:
+                        urlretrieve(archive_uri, self.archive_path)
+                        print("Download complete.")
+                    except Exception as e:
+                        print(f"Download failed: {e}")
+                else:
+                    print(f"Warning: Archive not found at {self.archive_path} and no URI provided.")
+
+            # 2. Extract
+            if os.path.exists(self.archive_path):
+                print(f"Extracting {self.archive_path} to {os.path.dirname(self.data_dir)}...")
+                with tarfile.open(self.archive_path, "r:gz") as tar:
                     tar.extractall(path=os.path.dirname(self.data_dir))
                 print("Extraction complete.")
             else:
-                print(f"Warning: Archive not found at {archive_path}. Attempting to load from {self.data_dir} anyway.")
+                print(f"Warning: Archive not found at {self.archive_path}. Attempting to load from {self.data_dir} anyway.")
         else:
             print(f"Data already found at {self.data_dir}")
 
@@ -424,7 +457,7 @@ def main(config: TrainingConfig):
         mlflow.end_run()
 
     # Initialize Dataset Manager
-    dataset_manager = DatasetManager(config.archive_path, config.data_dir)
+    dataset_manager = DatasetManager(config.archive_path, config.data_dir, config.archive_uri)
 
     # Get PyTorch Datasets
     # Note: We access the underlying HF dataset object for MLflow logging using .ds
