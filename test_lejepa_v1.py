@@ -381,9 +381,6 @@ class MetricsLogger:
         print(f"Epoch {epoch} Summary:")
         # Sort keys for readability
         for key in sorted(metrics.keys()):
-            # Skip 'epoch' key in list as it's in the header
-            if key == 'epoch': 
-                continue
             value = metrics[key]
             if isinstance(value, (float, np.floating)):
                 print(f"  {key}: {value:.4f}")
@@ -613,11 +610,11 @@ def main(config: TrainingConfig):
                         'lr': current_lr,
                         'grad_norm': grad_norm.item(),
                         'step': global_step,
-                        'val_acc0': acc,
+                        'val_acc': acc,
                         'global_step': global_step,
-                        'epoch': epoch,
+                        'epoch': epoch+1,
                         'batch_idx', batch_idx+1,
-                        'train_epoch_loss', avg_loss,
+                        'avg_loss', avg_loss,
                     }
                     logger.log(step_metrics, step=global_step)
                     global_step += 1
@@ -634,14 +631,13 @@ def main(config: TrainingConfig):
             
             # ---- Log Epoch Metrics via Logger ----
             epoch_metrics = {
-                'epoch': epoch+1,
-                'train_loss': avg_loss,
-                'train_lejepa_loss': avg_lejepa,
-                'train_probe_loss': avg_probe,
-                'val_acc': acc,
-                'lr': current_lr,
-                # Explicit key for MLflow consistency if needed, but logger maps all keys
-                'train_epoch_loss': avg_loss
+                'epoch_e': epoch+1,
+                'avg_loss_e': avg_loss,
+                'train_lejepa_loss_e': avg_lejepa,
+                'train_probe_loss_e': avg_probe,
+                'val_acc_e': acc,
+                'best_acc_e': best_acc,
+                'lr_e': current_lr,
             }
             logger.log(epoch_metrics, step=global_step, epoch=epoch+1)
 
