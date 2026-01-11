@@ -746,6 +746,11 @@ def main(config: TrainingConfig):
         print(f"Best Validation Accuracy: {best_acc:.4f}")
         print(f"Final Validation Accuracy: {acc:.4f}")
         print(f"{'='*60}\n")
+
+        # Explicitly delete dataloaders to terminate worker processes
+        # This prevents the process from hanging and keeping the MLflow run "Running"
+        del train_dl
+        del test_dl
     
     # ---------------- Cleanup ----------------
     # Remove the extracted dataset directory to keep Kaggle output clean
