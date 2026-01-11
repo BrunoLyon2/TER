@@ -787,10 +787,22 @@ def main(config: TrainingConfig):
         del train_dl
         del test_dl
     
-    # ---------------- Cleanup ----------------
-    # Remove the extracted dataset directory to keep Kaggle output clean
-    dataset_manager.cleanup()
+        # ---------------- Cleanup ----------------
+        # Remove the extracted dataset directory to keep Kaggle output clean
+        dataset_manager.cleanup()
 
+        # Ending mlflow logging.
+        mlflow.end_run()
+
+
+    if mlflow.active_run():
+        print("Warning: Found an active MLflow run.")
+        #mlflow.end_run()
+    
+    print(f"\n{'*'*60}")
+    print(f"{'*'*60}")
+    print("FINISHED!!!! ")
+    print(f"{'*'*60}")
 
 if __name__ == "__main__":
     # Create configuration with custom parameters
