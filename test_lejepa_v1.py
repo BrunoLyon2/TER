@@ -383,7 +383,7 @@ class MetricsLogger:
         # Key -> List of values (e.g., 'val_acc': [0.1, 0.2, ...])
         self.metrics = {}
     
-    def log(self, metrics: dict, step: int, epoch: Optional[int] = None):
+    def log(self, metrics: dict, step: int, epoch: Optional[int] = None, do_mlflow_log: Optional[bool] = True):
         """
         Log metrics to MLflow. If 'epoch' is provided, also update local history and print summary.
         
@@ -391,13 +391,15 @@ class MetricsLogger:
             metrics: Dictionary of metric names and values.
             step: Global step for MLflow logging.
             epoch: If provided, treat as epoch-end summary (update history & print).
+            do_mlflow_log: flag whether to log in mlflow or not.
         """
         # 1. Log to MLflow
-        try:
-            mlflow.log_metrics(metrics, step=step)
-        except Exception as e:
-            # Don't fail silently - at least print the error
-            print(f"Warning: MLflow logging failed at step {step}: {e}")
+        if do_mlflow_log:
+            try:
+                mlflow.log_metrics(metrics, step=step)
+            except Exception as e:
+                # Don't fail silently - at least print the error
+                print(f"Warning: MLflow logging failed at step {step}: {e}")
 
         # 2. Handle Epoch End logic (History + Print)
         if epoch is not None:
@@ -661,7 +663,7 @@ def main(config: TrainingConfig):
                         'best_acc': best_acc,
                     }
                     print(f"Logging step {global_step}")
-                    logger.log(step_metrics, step=global_step, epoch=epoch)
+                    logger.log(step_metrics, step=global_step, epoch=epoch+1)
                     global_step += 1
 
             # Calculate epoch averages
@@ -692,7 +694,7 @@ def main(config: TrainingConfig):
                 'best_acc': best_acc,
             }
             print(f"Logging step {global_step} from epoch: {epoch}.")
-            #logger.log(epoch_metrics, step=(len(train_dl)*(epoch+1)), epoch=epoch+1)
+            logger.log(epoch_metrics, step=(len(train_dl)*(epoch+1)), epoch=epoch+1, do_mlflow_log=False)
 
             # Save best model
             if acc > best_acc:
