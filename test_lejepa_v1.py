@@ -359,11 +359,12 @@ class MetricsLogger:
             step: Global step for MLflow logging.
             epoch: If provided, treat as epoch-end summary (update history & print).
         """
-        # 1. Log to MLflow
+        # 1. Log to MLflow with better error handling
         try:
             mlflow.log_metrics(metrics, step=step)
-        except Exception:
-            pass # Fail silently if MLflow not active or configured
+        except Exception as e:
+            # Don't fail silently - at least print the error
+            print(f"Warning: MLflow logging failed at step {step}: {e}")
 
         # 2. Handle Epoch End logic (History + Print)
         if epoch is not None:
@@ -501,8 +502,11 @@ def main(config: TrainingConfig):
     best_acc = 0.0
     acc = 0.0
     avg_loss = 0.0
+    avg_lejepa = 0.0
+    avg_probe = 0.0
     patience = 0
     global_step = 0
+    
     
     # ---------------- Setup MLflow ----------------
     try:
@@ -615,8 +619,12 @@ def main(config: TrainingConfig):
                         'epoch': epoch+1,
                         'batch_idx': batch_idx+1,
                         'avg_loss': avg_loss,
+                        'avg_lejepa': avg_lejepa,
+                        'avg_probe': avg_probe,
+                        'best_acc': best_acc,
                     }
-                    logger.log(step_metrics, step=global_step)
+                    print(f"Logging step {global_step}")
+                    logger.log(step_metrics, step=global_step, epoch=epoch)
                     global_step += 1
 
             # Calculate epoch averages
@@ -631,15 +639,23 @@ def main(config: TrainingConfig):
             
             # ---- Log Epoch Metrics via Logger ----
             epoch_metrics = {
-                'epoch_e': epoch+1,
-                'avg_loss_e': avg_loss,
-                'train_lejepa_loss_e': avg_lejepa,
-                'train_probe_loss_e': avg_probe,
-                'val_acc_e': acc,
-                'best_acc_e': best_acc,
-                'lr_e': current_lr,
+                'train_batch_loss': loss.item() * config.accum_steps,
+                'train_lejepa_loss': lejepa_loss.item(),
+                'train_probe_loss': probe_loss.item(),
+                'lr': current_lr,
+                'grad_norm': grad_norm.item(),
+                'step': global_step,
+                'val_acc': acc,
+                'global_step': global_step,
+                'epoch': epoch+1,
+                'batch_idx': batch_idx+1,
+                'avg_loss': avg_loss,
+                'avg_lejepa': avg_lejepa,
+                'avg_probe': avg_probe,
+                'best_acc': best_acc,
             }
-            logger.log(epoch_metrics, step=global_step, epoch=epoch+1)
+            print(f"Logging step {global_step} from epoch: {epoch}.")
+            #logger.log(epoch_metrics, step=(len(train_dl)*(epoch+1)), epoch=epoch+1)
 
             # Save best model
             if acc > best_acc:
