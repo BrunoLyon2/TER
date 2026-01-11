@@ -359,7 +359,7 @@ class MetricsLogger:
             step: Global step for MLflow logging.
             epoch: If provided, treat as epoch-end summary (update history & print).
         """
-        # 1. Log to MLflow with better error handling
+        # 1. Log to MLflow
         try:
             mlflow.log_metrics(metrics, step=step)
         except Exception as e:
@@ -417,6 +417,11 @@ def main(config: TrainingConfig):
     config.print_config()
     
     torch.manual_seed(0)
+
+    # Clean up any stale MLflow runs (common in notebook environments)
+    if mlflow.active_run():
+        print("Note: Found an active MLflow run. Ending it now to start a fresh one.")
+        mlflow.end_run()
 
     # Initialize Dataset Manager
     dataset_manager = DatasetManager(config.archive_path, config.data_dir)
@@ -507,7 +512,6 @@ def main(config: TrainingConfig):
     patience = 0
     global_step = 0
     
-    
     # ---------------- Setup MLflow ----------------
     try:
         mlflow.set_experiment(config.mlflow_experiment)
@@ -515,7 +519,7 @@ def main(config: TrainingConfig):
     except Exception as e:
         print(f"Note: Could not explicitly set MLflow experiment (might be running in a notebook with default exp). Error: {e}")
 
-    with mlflow.start_run():
+    with mlflow.start_run() as run:
         # Log all configuration parameters
         mlflow.log_params(asdict(config))
         
