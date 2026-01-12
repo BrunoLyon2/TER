@@ -25,9 +25,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
 
-# Suppress specific MLflow warnings about integer schemas (harmless for our dense dataset)
-warnings.filterwarnings("ignore", message=".*Inferred schema contains integer column.*")
-
 # Global variable for Experiment Name (retrieved from secrets)
 DATABRICKS_MLEXPE = ""
 
@@ -786,7 +783,7 @@ def main(config: TrainingConfig):
 
         # Save final model
         print("\nSaving final model...")
-        final_filename = f"final_model_epoch_{epoch+1}_acc_{acc:.4f}.pth"
+        final_filename = "final_model.pth"
         final_checkpoint = {
             'net_state_dict': net.state_dict() if not hasattr(net, '_orig_mod') else net._orig_mod.state_dict(),
             'probe_state_dict': probe.state_dict() if not hasattr(probe, '_orig_mod') else probe._orig_mod.state_dict(),
@@ -834,7 +831,7 @@ def main(config: TrainingConfig):
 
 
 
-def main2(config: TrainingConfig):
+def main2(config: TrainingConfig, model_path="best_model.pth"):
     """Main2: Load best model and evaluate (Confusion Matrix)."""
     print("\n" + "="*60)
     print("Starting Main2: Confusion Matrix Evaluation")
@@ -858,8 +855,6 @@ def main2(config: TrainingConfig):
         nn.Dropout(config.probe_dropout),
         nn.Linear(512, config.num_classes)
     ).to(device)
-    
-    model_path = "best_model.pth"
     
     # Check local, otherwise fetch from Databricks
     if not os.path.exists(model_path):
@@ -935,6 +930,7 @@ def main2(config: TrainingConfig):
         class_names = test_ds.ds.features['label'].names
     except:
         class_names = [str(i) for i in range(config.num_classes)]
+        print(f"got error with class_names (keep moving): {e}")
         
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
     plt.xlabel('Predicted')
@@ -973,4 +969,4 @@ if __name__ == "__main__":
     
     main(config)
         
-    main2(config)
+    main2(config, "final_model.pth")
