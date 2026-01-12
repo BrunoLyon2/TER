@@ -159,6 +159,10 @@ class TrainingConfig:
     archive_path: Optional[str] = None
     data_dir: Optional[str] = None
     archive_uri: str = "https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-160.tgz"
+
+    # Saving
+    is_save_best_model: bool = False
+    is_save_last_model: bool = False
     
     # MLflow
     mlflow_experiment: str = "" # Name of the experiment in Databricks/MLflow
@@ -728,8 +732,9 @@ def main(config: TrainingConfig):
                     'best_accuracy': best_acc,
                     'metrics': logger.metrics
                 }
-                #torch.save(checkpoint, "best_model.pth")
-                #mlflow.log_artifact("best_model.pth")
+                if config.is_save_best_model:
+                    torch.save(checkpoint, "best_model.pth")
+                    mlflow.log_artifact("best_model.pth")
                 
                 # 2. Log deployment-ready model with signature
                 if example_input_tensor is not None:
@@ -787,8 +792,10 @@ def main(config: TrainingConfig):
             'best_accuracy': best_acc,
             'metrics': logger.metrics
         }
-        #torch.save(final_checkpoint, final_filename)
-        #mlflow.log_artifact(final_filename)
+
+        if config.is_save_last_model:
+            torch.save(final_checkpoint, final_filename)
+            mlflow.log_artifact(final_filename)
         
         print(f"\n{'='*60}")
         print("Training Complete!")
@@ -821,6 +828,7 @@ def main(config: TrainingConfig):
 if __name__ == "__main__":
     # Create configuration with custom parameters
     config = TrainingConfig(
+        is_save_last_model=True,
         epochs=100,
         patience=100,
         num_workers=2,# with T4
