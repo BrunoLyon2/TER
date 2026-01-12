@@ -784,7 +784,14 @@ def main(config: TrainingConfig):
 
         # --- MLflow Evaluate on Best Model ---
         # This replaces the need for main2 for standard metrics
-        model_to_load = "best_model.pth"
+        if config.is_save_best_model:
+            model_to_load = "best_model.pth"
+        elif config.is_save_last_model:
+            model_to_load = "final_model.pth"
+        else:
+            # will make try to fail, not clean but should work.
+            model_to_load = None
+
         print("\nRunning MLflow Evaluate on best model...")
         try:
             # 1. Reload best weights
@@ -1022,7 +1029,7 @@ def main2(config: TrainingConfig, model_path="best_model.pth"):
 if __name__ == "__main__":
     # Create configuration with custom parameters
     config = TrainingConfig(
-        is_save_last_model=True,
+        is_save_last_model=True, #less computing than best (then we expect at least two saves)
         epochs=100,
         patience=100,
         num_workers=2,# with T4
