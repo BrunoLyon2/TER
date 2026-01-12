@@ -21,6 +21,12 @@ from torchvision.ops import MLP
 import mlflow
 import mlflow.data 
 import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+
+# Suppress specific MLflow warnings about integer schemas (harmless for our dense dataset)
+warnings.filterwarnings("ignore", message=".*Inferred schema contains integer column.*")
 
 # Global variable for Experiment Name (retrieved from secrets)
 DATABRICKS_MLEXPE = ""
@@ -178,12 +184,12 @@ class TrainingConfig:
                 self.archive_path = "/content/imagenette2-160.tgz"
                 self.data_dir = "/content/imagenette2-160"
             else: # local
-                self.archive_path = "imagenette2-160.tgz"
-                self.data_dir = "./imagenette2-160"
+                self.archive_path = "imagenette-160.tgz"
+                self.data_dir = "./imagenette-160"
         
         # Ensure data_dir is set if archive_path was manual but data_dir wasn't
         if self.data_dir is None:
-            self.data_dir = "./imagenette2-160"
+            self.data_dir = "./imagenette-160"
 
         # 2. Validation
         assert self.bs > 0, "Batch size must be positive"
@@ -482,7 +488,7 @@ def main(config: TrainingConfig):
     train_ds = dataset_manager.get_ds(split="train", V=config.V, img_size=config.img_size)
     test_ds = dataset_manager.get_ds(split="validation", V=1, img_size=config.img_size)
     
-    # DataLoaders with improved settings
+    # DataLoaders
     train_dl = DataLoader(
         train_ds, 
         batch_size=config.bs, 
@@ -504,12 +510,13 @@ def main(config: TrainingConfig):
 
     # Modules and loss
     net = ImageEncoder(
-        model_name=config.backbone,
+        model_name=config.backbone, 
         proj_dim=config.proj_dim, 
         drop_path_rate=config.drop_path_rate,
         proj_dropout=config.proj_dropout,
         img_size=config.img_size
     ).to(device)
+    
     probe = nn.Sequential(
         nn.LayerNorm(512),
         nn.Dropout(config.probe_dropout),
@@ -530,7 +537,7 @@ def main(config: TrainingConfig):
             else:
                 print(f"Skipping torch.compile: GPU capability {capability[0]}.{capability[1]} < 7.0 (Triton requirement)")
     except Exception as e:
-        print(f"Model compilation not available or failed: {e}")
+        print(f"Model compilation failed: {e}")
     
     # Optimizer and scheduler
     g1 = {"params": net.parameters(), "lr": config.lr, "weight_decay": config.weight_decay}
@@ -825,6 +832,134 @@ def main(config: TrainingConfig):
     print("FINISHED!!!! ")
     print(f"{'*'*60}")
 
+
+
+def main2(config: TrainingConfig):
+    """Main2: Load best model and evaluate (Confusion Matrix)."""
+    print("\n" + "="*60)
+    print("Starting Main2: Confusion Matrix Evaluation")
+    print("="*60 + "\n")
+    
+    torch.manual_seed(0)
+    
+    dataset_manager = DatasetManager(config.archive_path, config.data_dir, config.archive_uri)
+    test_ds = dataset_manager.get_ds(split="validation", V=1, img_size=config.img_size)
+    test_dl = DataLoader(test_ds, batch_size=256, num_workers=config.num_workers, pin_memory=True)
+    
+    # Init Architecture
+    net = ImageEncoder(
+        model_name=config.backbone, 
+        proj_dim=config.proj_dim, 
+        img_size=config.img_size
+    ).to(device)
+    
+    probe = nn.Sequential(
+        nn.LayerNorm(512),
+        nn.Dropout(config.probe_dropout),
+        nn.Linear(512, config.num_classes)
+    ).to(device)
+    
+    model_path = "best_model.pth"
+    
+    # Check local, otherwise fetch from Databricks
+    if not os.path.exists(model_path):
+        print(f"Local '{model_path}' not found. Attempting to search and download from Databricks/MLflow...")
+        try:
+            # 1. Get Experiment
+            from mlflow.tracking import MlflowClient
+            client = MlflowClient()
+            
+            exp_name = config.mlflow_experiment if config.mlflow_experiment else "LejEPA_Experiment"
+            experiment = client.get_experiment_by_name(exp_name)
+            
+            if experiment is None:
+                print(f"Error: Experiment '{exp_name}' not found on remote.")
+                return
+
+            # 2. Get latest successful run
+            runs = client.search_runs(
+                experiment_ids=[experiment.experiment_id],
+                filter_string="status = 'FINISHED'",
+                order_by=["attribute.start_time DESC"],
+                max_results=1
+            )
+
+            if not runs:
+                print("Error: No finished runs found in experiment.")
+                return
+
+            latest_run_id = runs[0].info.run_id
+            print(f"Found latest run: {latest_run_id} (Date: {runs[0].data.tags.get('mlflow.runName', 'Unknown')})")
+
+            # 3. Download artifact
+            # This downloads to a temp dir managed by MLflow and returns the absolute path
+            model_path = mlflow.artifacts.download_artifacts(run_id=latest_run_id, artifact_path="best_model.pth")
+            print(f"Downloaded model to: {model_path}")
+
+        except Exception as e:
+            print(f"Failed to download from MLflow: {e}")
+            return
+
+    print(f"Loading model from {model_path}...")
+    checkpoint = torch.load(model_path, map_location=device)
+    
+    # Load and clean keys
+    net_state = {k.replace('_orig_mod.', ''): v for k, v in checkpoint['net_state_dict'].items()}
+    probe_state = {k.replace('_orig_mod.', ''): v for k, v in checkpoint['probe_state_dict'].items()}
+    
+    net.load_state_dict(net_state)
+    probe.load_state_dict(probe_state)
+    net.eval()
+    probe.eval()
+    
+    all_preds = []
+    all_targets = []
+    
+    print("Running inference...")
+    with torch.no_grad():
+        for vs, y in tqdm.tqdm(test_dl, desc="Evaluating"):
+            vs = vs.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            with autocast(device, dtype=amp_dtype, enabled=use_amp):
+                emb, _ = net(vs)
+                preds = probe(emb).argmax(1)
+            all_preds.extend(preds.cpu().numpy())
+            all_targets.extend(y.cpu().numpy())
+            
+    cm = confusion_matrix(all_targets, all_preds)
+    
+    # Plotting
+    plt.figure(figsize=(10, 8))
+    # Try to get class names, fallback to indices
+    try:
+        class_names = test_ds.ds.features['label'].names
+    except:
+        class_names = [str(i) for i in range(config.num_classes)]
+        
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title(f'Confusion Matrix (Best Acc: {checkpoint.get("best_accuracy", "?"):.4f})')
+    plt.tight_layout()
+    
+    cm_filename = "confusion_matrix.png"
+    plt.savefig(cm_filename)
+    print(f"Confusion matrix saved to {cm_filename}")
+    
+    # Optional Log to MLflow (New run for eval)
+    if config.mlflow_experiment:
+        try:
+            mlflow.set_experiment(config.mlflow_experiment)
+            with mlflow.start_run(run_name="Evaluation_Confusion_Matrix"):
+                mlflow.log_artifact(cm_filename)
+                print("Logged confusion matrix to MLflow.")
+        except Exception as e:
+            print(f"Could not log to MLflow: {e}")
+            
+    plt.show()
+    dataset_manager.cleanup()
+
+
 if __name__ == "__main__":
     # Create configuration with custom parameters
     config = TrainingConfig(
@@ -836,8 +971,6 @@ if __name__ == "__main__":
         platform=CURRENT_PLATFORM
     )
     
-    # You can also override specific parameters like this:
-    # config.epochs = 100
-    # config.patience = 30
-    
     main(config)
+        
+    main2(config)
