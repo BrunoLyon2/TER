@@ -568,7 +568,7 @@ def main(config: TrainingConfig):
         print(f"Note: Could not explicitly set MLflow experiment (might be running in a notebook with default exp). Error: {e}")
 
     now = datetime.now()
-    with mlflow.start_run(run_name=f"run_{CURRENT_PLATFORM}_epoch_{config.epochs}_{now.strftime('%Y-%m-%d_%H-%M')}") as run:
+    with mlflow.start_run(run_name=f"run_{CURRENT_PLATFORM}_{config.backbone}_epoch_{config.epochs}_{now.strftime('%Y-%m-%d_%H-%M')}") as run:
         # Log all configuration parameters
         mlflow.log_params(asdict(config))
         
@@ -750,7 +750,7 @@ def main(config: TrainingConfig):
                         
                         mlflow.pytorch.log_model(
                             inference_model,
-                            name=f"deployment_model_epoch_{epoch}",
+                            name=f"deployment_model_epoch_{epoch}_acc_{acc:.4f}".replace('.', ''),
                             signature=signature,
                             input_example=example_input
                         )
