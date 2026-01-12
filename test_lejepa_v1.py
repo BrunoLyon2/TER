@@ -21,6 +21,7 @@ from torchvision.ops import MLP
 import mlflow
 import mlflow.data 
 import numpy as np
+import pandas as pd # Added for mlflow.evaluate
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
@@ -781,6 +782,68 @@ def main(config: TrainingConfig):
             if device == "cuda" and (epoch + 1) % 5 == 0:
                 torch.cuda.empty_cache()
 
+        # --- MLflow Evaluate on Best Model ---
+        # This replaces the need for main2 for standard metrics
+        model_to_load = "best_model.pth"
+        print("\nRunning MLflow Evaluate on best model...")
+        try:
+            # 1. Reload best weights
+            checkpoint = torch.load(model_to_load, map_location=device)
+            # Clean keys if needed
+            net_state = {k.replace('_orig_mod.', ''): v for k, v in checkpoint['net_state_dict'].items()}
+            probe_state = {k.replace('_orig_mod.', ''): v for k, v in checkpoint['probe_state_dict'].items()}
+            
+            # Wrap in inference model
+            eval_model = InferenceModel(
+                net._orig_mod if hasattr(net, '_orig_mod') else net,
+                probe._orig_mod if hasattr(probe, '_orig_mod') else probe
+            )
+            eval_model.net.load_state_dict(net_state)
+            eval_model.probe.load_state_dict(probe_state)
+            eval_model.eval()
+            eval_model.to(device)
+
+            # 2. Gather Predictions & Targets from Validation Set
+            print("Generating predictions for evaluation...")
+            all_preds = []
+            all_probs = [] # MLflow likes probs for ROC/PR curves
+            all_targets = []
+            
+            with torch.no_grad():
+                for vs, y in tqdm.tqdm(test_dl, desc="Evaluating"):
+                    vs = vs.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
+                    with autocast(device, dtype=amp_dtype, enabled=use_amp):
+                        logits = eval_model(vs)
+                        probs = torch.softmax(logits, dim=1)
+                        preds = probs.argmax(1)
+                    
+                    all_preds.extend(preds.cpu().numpy())
+                    all_probs.extend(probs.cpu().numpy())
+                    all_targets.extend(y.cpu().numpy())
+            
+            # 3. Create DataFrame
+            eval_df = pd.DataFrame({
+                "target": all_targets,
+                "prediction": all_preds
+            })
+            
+            # 4. Call MLflow Evaluate
+            # Note: For multiclass ROC/AUC, we ideally pass probabilities.
+            # However, dataframe format for probs in multiclass is tricky (requires list of arrays).
+            # We stick to standard metrics based on hard predictions for simplicity.
+            mlflow.evaluate(
+                data=eval_df,
+                targets="target",
+                predictions="prediction",
+                model_type="classifier",
+                evaluator_config={"metric_prefix": "val_"},
+            )
+            print("MLflow evaluation complete. Check UI for Confusion Matrix and metrics.")
+
+        except Exception as e:
+            print(f"MLflow Evaluate failed: {e}")
+
         # Save final model
         print("\nSaving final model...")
         final_filename = "final_model.pth"
@@ -969,4 +1032,4 @@ if __name__ == "__main__":
     
     main(config)
         
-    main2(config, "final_model.pth")
+    #main2(config, "final_model.pth")
