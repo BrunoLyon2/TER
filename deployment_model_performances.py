@@ -2,6 +2,7 @@ import os
 import shutil
 import tarfile
 import mlflow
+import mlflow.pytorch
 import torch
 import numpy as np
 import pandas as pd
@@ -12,17 +13,20 @@ from urllib.request import urlretrieve
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from torchvision.transforms import v2
 from datasets import load_dataset
-from torch.utils.data import DataLoader
-    
+
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
 @dataclass
 class TrainingConfig:
+    # --- Databricks Connection Details ---
+    # You can set these here or via environment variables: DATABRICKS_HOST, DATABRICKS_TOKEN
+    databricks_host: Optional[str] = None  # e.g., "https://adb-xxxx.xx.azuredatabricks.net"
+    databricks_token: Optional[str] = None # e.g., "dapi12345..."
+    
     # Model Registry Details
-    model_name: str = "Your_Model_Name_Here"
+    model_name: str = "Your_Registered_Model_Name"
     model_version: str = "1"
-    # Note: Construct URI in post_init or property to access self fields
     
     # Data Details
     archive_path: str = "imagenette2-160.tgz"
@@ -35,7 +39,31 @@ class TrainingConfig:
         return f"models:/{self.model_name}/{self.model_version}"
 
 # ==========================================
-# 2. DATASET CLASSES (Your Custom Logic)
+# 2. SETUP & UTILS
+# ==========================================
+def setup_databricks_connection(config: TrainingConfig):
+    """
+    Configures MLflow to talk to the remote Databricks workspace.
+    """
+    # 1. Set Credentials (if provided in config, otherwise rely on Env Vars)
+    if config.databricks_host:
+        os.environ["DATABRICKS_HOST"] = config.databricks_host
+    if config.databricks_token:
+        os.environ["DATABRICKS_TOKEN"] = config.databricks_token
+
+    # 2. Verify Credentials exist
+    if not os.environ.get("DATABRICKS_HOST") or not os.environ.get("DATABRICKS_TOKEN"):
+        print("Warning: DATABRICKS_HOST or DATABRICKS_TOKEN not found in environment or config.")
+        print("Please set them to access your remote model registry.")
+        return False
+
+    # 3. Set Tracking URI to Databricks
+    print(f"Setting MLflow Tracking URI to 'databricks'...")
+    mlflow.set_tracking_uri("databricks")
+    return True
+
+# ==========================================
+# 3. DATASET CLASSES
 # ==========================================
 class _DatasetSplit(torch.utils.data.Dataset):
     """Internal dataset class used by DatasetManager."""
@@ -136,83 +164,90 @@ class DatasetManager:
             shutil.rmtree(self.data_dir)
 
 # ==========================================
-# 3. MAIN EXECUTION
+# 4. MAIN EXECUTION
 # ==========================================
 def main():
     # 1. Setup Config
-    # Update these values to match your specific model registry details
     config = TrainingConfig(
+        # --- Authentication ---
+        # Enter your Databricks Workspace URL and Access Token below
+        databricks_host="https://adb-123456789.0.azuredatabricks.net", # <--- PASTE YOUR URL HERE
+        databricks_token="dapi...", # <--- PASTE YOUR TOKEN HERE
+        
+        # Model Registry Details
         model_name="Your_Registered_Model_Name", 
         model_version="1",
         data_dir="./imagenette2-160"
     )
 
-    # 2. Initialize Data Manager
+    # 2. Setup MLflow for Databricks
+    if not setup_databricks_connection(config):
+        return
+
+    # 3. Initialize Data Manager
     dataset_manager = DatasetManager(config.archive_path, config.data_dir, config.archive_uri)
 
-    # 3. Get Validation Dataset
-    # We use validation set for confusion matrix
+    # 4. Get Validation Dataset
     print("Initializing Validation Dataset...")
     val_ds = dataset_manager.get_ds(split="validation", V=1, img_size=config.img_size)
     class_names = val_ds.classes
     print(f"Classes found: {class_names}")
 
-    # 4. Prepare Data for MLflow Predict
-    # MLflow 'pyfunc' usually expects a Numpy Array or Pandas DataFrame.
-    # We iterate the dataset to stack tensors into a single Numpy Array.
-    print("Preparing data for prediction (converting tensors to numpy)...")
-    
-    X_list = []
-    y_list = []
-    
-    # We use a DataLoader for efficient batching, but here we just iterate to collect
-    # For very large datasets, process in chunks. For imagenette/confusion matrix, this is fine.
-    loader = DataLoader(val_ds, batch_size=32, shuffle=False)
-    
-    for images, labels in loader:
-        # images shape from __getitem__ is [Batch, 1, Channels, Height, Width]
-        # We need [Batch, Channels, Height, Width] for the model
-        if len(images.shape) == 5:
-            images = images.squeeze(1)
-            
-        X_list.append(images.numpy())
-        y_list.append(labels.numpy())
-
-    # Concatenate all batches
-    X_test = np.concatenate(X_list, axis=0)
-    y_test = np.concatenate(y_list, axis=0)
-    
-    print(f"Data prepared. X_test shape: {X_test.shape}, y_test shape: {y_test.shape}")
-
-    # 5. Load Model & Predict
+    # 5. Load Model (Native PyTorch)
     print(f"Loading model from: {config.model_uri}...")
     try:
-        loaded_model = mlflow.pyfunc.load_model(config.model_uri)
+        # Using native pytorch loader since model was saved with log_model
+        loaded_model = mlflow.pytorch.load_model(config.model_uri)
     except Exception as e:
-        print(f"Failed to load model from {config.model_uri}. Ensure you are connected to Databricks/MLflow.")
-        print(f"Error: {e}")
+        print(f"\n[ERROR] Failed to load model. Please check:")
+        print("1. Your DATABRICKS_HOST and DATABRICKS_TOKEN are correct.")
+        print("2. You have 'mlflow[databricks]' installed.")
+        print(f"Original Error: {e}")
         return
 
+    # Move to GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Moving model to device: {device}")
+    loaded_model.to(device)
+    loaded_model.eval()
+
+    # 6. Generate Predictions
     print("Generating predictions...")
-    # X_test is now a numpy array of shape (N, C, H, W)
-    y_pred_raw = loaded_model.predict(X_test)
-
-    # 6. Post-Process Predictions
-    # If the model outputs probabilities (common for Deep Learning), take argmax
-    if isinstance(y_pred_raw, pd.DataFrame):
-        y_pred_raw = y_pred_raw.values
-        
-    if len(y_pred_raw.shape) > 1 and y_pred_raw.shape[1] > 1:
-        print("Model output appears to be probabilities. Converting to class labels via ArgMax.")
-        y_pred = np.argmax(y_pred_raw, axis=1)
-    else:
-        y_pred = y_pred_raw
-
-    # 7. Generate & Plot Confusion Matrix
-    print("Plotting Confusion Matrix...")
-    cm = confusion_matrix(y_test, y_pred)
     
-    # Use class names from dataset if available
+    y_preds = []
+    y_true = []
+    
+    from torch.utils.data import DataLoader
+    loader = DataLoader(val_ds, batch_size=32, shuffle=False)
+    
+    # We loop through the DataLoader directly instead of converting to Numpy
+    # This prevents memory overflow and allows proper PyTorch batching
+    with torch.no_grad():
+        for i, (images, labels) in enumerate(loader):
+            if i % 10 == 0:
+                print(f"Processing batch {i}...")
+
+            # Ensure correct shape [Batch, C, H, W]
+            if len(images.shape) == 5:
+                images = images.squeeze(1)
+            
+            # Move data to GPU
+            images = images.to(device)
+            
+            # Predict
+            outputs = loaded_model(images)
+            
+            # Handle output (assuming Logits or Softmax)
+            # We take the argmax to get the class index
+            preds = torch.argmax(outputs, dim=1)
+            
+            # Store results (move back to CPU for storage)
+            y_preds.extend(preds.cpu().numpy())
+            y_true.extend(labels.numpy())
+
+    # 7. Plot Confusion Matrix
+    print("Plotting Confusion Matrix...")
+    cm = confusion_matrix(y_true, y_preds)
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
     
     fig, ax = plt.subplots(figsize=(10, 8))
